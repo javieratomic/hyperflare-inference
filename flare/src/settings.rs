@@ -2,7 +2,7 @@
 //! Explicit host configuration shared by application clients.
 #[path = "runtime_settings.rs"]
 mod runtime;
-use crate::configuration::{Configuration, expand, nonempty, size};
+use crate::configuration::{Configuration, expand, nonempty, size, system_headroom};
 use crate::options::HubOptions;
 use flare_helios::{
     offload::{PrefixCacheOffload, parse_drain_on_shutdown, parse_max_age},
@@ -24,6 +24,7 @@ pub struct Settings {
     pub api_key: Option<String>,
     pub max_concurrency: Option<usize>,
     pub memory_reserve: Option<u64>,
+    pub system_headroom: Option<u64>,
     pub hub: HubOptions,
     pub trust_store: Option<PathBuf>,
     pub publisher_keys: Vec<PathBuf>,
@@ -37,7 +38,7 @@ mod tests {
     use super::*;
     #[test]
     fn settings_keep_shared_paths_and_model_override_precedence() {
-        let config=Configuration::parse("[paths]\ncore_cache='~/models'\nprefix_cache='~/prefix'\n[defaults]\nmax_concurrency=2\n[models.example]\nmax_concurrency=3\n[memory]\nreserve='8G'\n[prefix_cache]\nmemory='1GiB'\n").unwrap();
+        let config=Configuration::parse("[paths]\ncore_cache='~/models'\nprefix_cache='~/prefix'\n[defaults]\nmax_concurrency=2\n[models.example]\nmax_concurrency=3\n[memory]\nreserve='8G'\nsystem_headroom='4G'\n[prefix_cache]\nmemory='1GiB'\n").unwrap();
         let settings =
             Settings::resolve(config, Path::new("user"), Path::new("custom/config.toml")).unwrap();
         assert_eq!(settings.model_directory, Path::new("user/models"));
@@ -59,6 +60,10 @@ mod tests {
             Some(1 << 30)
         );
         assert_eq!(settings.memory_reserve, Some(8 << 30));
+        assert_eq!(
+            settings.load_options(&[]).unwrap().system_headroom_bytes,
+            Some(4 << 30)
+        );
         assert!(settings.runtime.prefix_cache_disk_enabled);
         assert_eq!(settings.load_options(&[]).unwrap().prefix_cache.disk, Some(PathBuf::from("user/prefix")));
     }
@@ -106,6 +111,7 @@ impl Settings {
             ..HubOptions::default()
         };
         let memory_reserve = size(configuration.memory.reserve.as_deref(), "memory.reserve")?;
+        let system_headroom = system_headroom(configuration.memory.system_headroom.as_deref())?;
         let prefix_cache = PrefixCacheOffload {
             memory_bytes: size(
                 nonempty(configuration.prefix_cache.memory.as_deref()),
@@ -175,6 +181,7 @@ impl Settings {
             api_key: configuration.server.api_key.filter(|key| !key.is_empty()),
             max_concurrency: configuration.defaults.max_concurrency.map(|v| v.get()),
             memory_reserve,
+            system_headroom,
             hub,
             trust_store: None,
             publisher_keys: Vec::new(),
@@ -202,6 +209,7 @@ impl Settings {
         let base = LoadOptions {
             max_concurrency: selected.or(self.max_concurrency),
             memory_limit: self.memory_reserve.map(MemoryLimit::Reserve),
+            system_headroom_bytes: self.system_headroom,
             prefix_cache: self.prefix_cache.clone(),
             ..LoadOptions::default()
         };

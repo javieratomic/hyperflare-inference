@@ -86,6 +86,8 @@ memory or local disk is enabled. It needs no setting: its slot count is
 The warm checkpoint budget rounds down to whole slots. If host headroom cannot
 hold the full intake, it shrinks toward two complete windows,
 `2 × (64 + row_slots)`, and one warning reports the memory needed for full intake.
+What is left for intake is available memory less the warm budget, a 2 GiB server
+allowance and the [system headroom](cli-design.md#runtime-memory-limits).
 Prepared image inputs use one eighth of the warm budget, rounded down to 4 KiB,
 in ordinary CPU memory; the rest holds checkpoint slots. Text-only cores use
 all warm bytes for checkpoints. CPU input serialization also has a separate
@@ -998,8 +1000,9 @@ its attachment after a lost connection.
 Before any CUDA registration, the complete Hello plan must fit both budgets:
 the manager's arena plus staging on this host, or the client's data staging for
 a remote manager. Host supply is available physical memory less future local
-host allocations, a 2 GiB server allowance and five percent of total RAM for the
-system. Every GPU is charged one device byte per 512 registered host bytes,
+host allocations, a 2 GiB server allowance and the
+[system headroom](cli-design.md#runtime-memory-limits), a twentieth of total RAM
+by default. Every GPU is charged one device byte per 512 registered host bytes,
 rounded up separately for each region, as for local registered tiers. Integrated
 GPUs also share the host-byte charge once per host. The check preserves runtime
 headroom, explicit memory limits and minimum execution/KV capacity; accepted

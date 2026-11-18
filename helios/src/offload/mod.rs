@@ -39,9 +39,12 @@ pub fn prepare(
     geometry: Vec<CacheGeometry>,
     contexts: Vec<(usize, i32)>,
 ) -> Result<Preparation> {
-    prepare_with_inputs(options, core, identity, geometry, contexts, 1, 0, None)
+    prepare_with_inputs(
+        options, core, identity, geometry, contexts, 1, 0, None, None,
+    )
 }
 
+/// `system` is the configured system headroom; `None` keeps a twentieth of total memory.
 pub fn prepare_with_inputs(
     options: &PrefixCacheOffload,
     core: &std::path::Path,
@@ -51,6 +54,7 @@ pub fn prepare_with_inputs(
     max_active: usize,
     input_staging: u64,
     shard: Option<(usize, usize)>,
+    system: Option<u64>,
 ) -> Result<Preparation> {
     Ok(flare_selene::offload::prepare_with_inputs(
         options,
@@ -61,6 +65,7 @@ pub fn prepare_with_inputs(
         max_active,
         input_staging,
         shard,
+        system,
         &registrar::CudaRegistrar,
     )?)
 }

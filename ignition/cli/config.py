@@ -24,7 +24,7 @@ _SECTIONS = {
                "scheduler_checkpoint_extra_work_fraction": (int, float)},
     "defaults": {"model": str, "max_concurrency": int, "image_concurrency": int,
                  "speculative_token_capacity": int, "speculative_graph_budget": int, "speculative_method": str},
-    "memory": {"reserve": str},
+    "memory": {"reserve": str, "system_headroom": str},
     "preparation": {"compile_workers": int, "autotune_effort": str, "collective_tuning": str, "checkpoint_token_file": str, "force_moe_decode_a16": bool},
     "prefix_cache": {"memory": str, "disk_limit": str, "drain_on_shutdown": str, "max_age": str},
     "paths": {"hub_cache": str, "kernel_cache": str, "core_cache": str, "export_staging": str,
@@ -32,12 +32,14 @@ _SECTIONS = {
 }
 _MODEL_KEYS = {"max_concurrency": int, "image_concurrency": int,
                "speculative_token_capacity": int, "speculative_graph_budget": int, "speculative_method": str}
-# Empty prefix-cache values leave the decision to Flare, which derives them from the host.
+# Empty system-headroom and prefix-cache values leave the decision to Flare, which derives them
+# from the host.
 _BUILT_IN = {
     "server.host": "127.0.0.1", "server.port": 8000, "server.api_key": "",
     "server.thinking_token_budget": None,
     "server.scheduler_checkpoint_extra_work_fraction": 0.05,
     "memory.reserve": "0",
+    "memory.system_headroom": "",
     "preparation.force_moe_decode_a16": False,
     "preparation.compile_workers": 0,
     "preparation.autotune_effort": "default",
@@ -99,9 +101,14 @@ class Configuration:
                 raise UsageError(f"{resolved}: unknown section [{section}]")
         configuration = cls(resolved, values, True)
         parse_size(configuration.get("memory.reserve").value)
-        for key in ("prefix_cache.memory", "prefix_cache.disk_limit"):
+        for key in ("memory.system_headroom", "prefix_cache.memory", "prefix_cache.disk_limit"):
             if configuration.get(key).value:
                 parse_size(configuration.get(key).value, key.replace(".", " "))
+        # A number without a suffix is a byte count; a fraction or a few bytes is a mistake.
+        headroom = configuration.get("memory.system_headroom").value
+        if headroom and parse_size(headroom) < 1 << 20 and float(_SIZE.fullmatch(headroom.strip())[1]):
+            raise UsageError(f'memory system_headroom {headroom!r} is below 1 MiB; '
+                             'give a size with a suffix, such as "4G", or 0')
         return configuration
 
     @staticmethod
@@ -204,6 +211,8 @@ class Configuration:
             "", "[memory]",
             f'# reserve = "{self.get("memory.reserve").value}"'
             "                   # GPU memory left untouched for processes that start later",
+            '# system_headroom = ""           # memory left to the system by unified-memory GPU caches and'
+            " host prefix-cache budgets; empty: a twentieth of total memory",
             "", "[paths]",
             f'# hub_cache = "{self.get("paths.hub_cache").value}"',
             f'# kernel_cache = "{self.get("paths.kernel_cache").value}"',

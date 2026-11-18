@@ -125,9 +125,42 @@ impl fmt::Display for MemoryLimit {
     }
 }
 
+/// Parse a system headroom: zero, or a size of at least 1 MiB. A number without a suffix is
+/// a byte count, so smaller sizes are refused: `0.05` or `6` would leave no real headroom.
+pub fn parse_system_headroom(value: &str) -> Result<u64, String> {
+    let bytes = crate::offload::parse_size(value)?;
+    let number = value
+        .trim()
+        .trim_end_matches(|c: char| !(c.is_ascii_digit() || c == '.'));
+    if bytes < 1 << 20 && number.parse::<f64>() != Ok(0.0) {
+        return Err(format!(
+            "system headroom {value:?} is below 1 MiB; give a size with a suffix, such as \"4G\", or 0"
+        ));
+    }
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_headroom_is_zero_or_at_least_one_mebibyte() {
+        for (text, expected) in [
+            ("0", 0),
+            ("0G", 0),
+            ("0.0", 0),
+            ("1M", 1u64 << 20),
+            ("1048576", 1 << 20),
+            ("1.5GiB", 3 << 29),
+            ("4g", 4 << 30),
+        ] {
+            assert_eq!(parse_system_headroom(text), Ok(expected), "{text}");
+        }
+        for text in ["0.05", "6", "1023K", "512K", "0.0005G", "", "-1G", "many"] {
+            assert!(parse_system_headroom(text).is_err(), "{text}");
+        }
+    }
 
     #[test]
     fn memory_limits_parse_and_round_trip() {

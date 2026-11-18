@@ -2106,6 +2106,7 @@ fn offload_startup_and_restore_cover_every_tier_combination() {
                     8,
                     0,
                     None,
+                    None,
                     registrar.as_ref(),
                 )
                 .unwrap();

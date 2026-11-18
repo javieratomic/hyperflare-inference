@@ -856,6 +856,7 @@ impl NativeModel {
             max_active,
             staging,
             shard,
+            options.system_headroom_bytes,
         )?;
         let summary = self.offload.attach(prepared, &crate::offload::transfer::Copiers)?;
         phase.finish(summary);

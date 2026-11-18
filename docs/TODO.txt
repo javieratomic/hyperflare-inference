@@ -504,3 +504,16 @@
     test_every_recipe_passes_collective_policy_to_preparation rewrites a TP4
     ladder to DeepSeek V4.1 TP3 or Muse Spark TP8; b12x rejects those gather
     and word-exchange candidates before the preparation handoff is tested.
+
+[ ] Qualify `--system-headroom` and `[memory] system_headroom` beyond one rank
+    per unified-memory Linux host, each given the flag or its own key. Not run:
+    Windows; a discrete GPU with the host prefix cache enabled, where the cache
+    plan must report the setting and intake must follow it; `flare run --hosts`
+    and `flare orbit run` carrying the value to ranks on separate hosts,
+    including the relaunch of a persistent Orbit group whose saved serving
+    options carry the flag; a host without swap (the hosts served have 16 GiB
+    each); and a headroom of 0. The loader passes the setting to cache sizing
+    and prefix-cache preparation in helios/src/runtime_core/memory.rs and
+    model.rs; no test loads a core, so those call sites are checked only by a
+    served run. Close when each run is recorded and a CUDA test covers the call
+    sites.

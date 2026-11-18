@@ -689,7 +689,8 @@ On GB10, a TP3 core with 32 concurrent requests, four image slots, seven
 DSpark drafts, BF16 MLA, and CSF expert scales occupies about 104.7 GiB per
 rank before physical cache backing. Use `--memory-limit=-1G` when launching
 this configuration to retain a 1 GiB reserve. The integrated-memory planner
-also preserves its separate 5% system allowance and 2 GiB host allowance.
+also preserves its separate 2 GiB host allowance and its system headroom, a twentieth
+of memory unless `--system-headroom` or `[memory] system_headroom` sets another size.
 A 4 GiB reserve leaves insufficient memory for continuation rows. Disk-backed
 Engram tables retain the default 1 GiB row cache per host.
 
@@ -1586,7 +1587,16 @@ SM121 core on Spark; an SM120 core does not satisfy the architecture
 check. GPU weights, KV, registered host buffers, resident embedding tables,
 compiler workers, and the OS compete for that memory. Set `[memory] reserve`
 for host activity as well as driver headroom; `reserve = "4G"` leaves four GiB
-outside the model's cache budget. RAM embedding tables load before cache
+outside the model's cache budget. Serving also leaves a
+[system headroom](cli-design.md#runtime-memory-limits) of a twentieth of
+memory, about 6 GiB on a Spark, which `--system-headroom` or
+`[memory] system_headroom` replaces. A configured headroom is qualified by
+serving DeepSeek V4.1 Flash at tensor parallelism 3 on three hosts with
+121.6 GiB of unified memory and 16 GiB of swap each, one rank per host, with
+headrooms of 4G, 2G and 1G and the default. On those hosts the ranks begin
+serving with more of their own memory in swap under a smaller headroom than
+under the default. Not qualified: a host without swap, and a headroom of 0;
+neither has been served. RAM embedding tables load before cache
 sizing. Disk embedding tables use bounded staging and can retain their scale
 planes in RAM with `--embedding-table-resident-scales`. The loader accounts for
 resident scales and the optional row cache before sizing KV, for both PLE and

@@ -18,7 +18,7 @@ use flare_helios::{
         PoolOptions, PrefixCacheOffload, parse_drain_on_shutdown, parse_max_age,
         parse_pool_address, parse_size,
     },
-    runtime_core::{KvCacheLimit, LoadOptions, MemoryLimit},
+    runtime_core::{KvCacheLimit, LoadOptions, MemoryLimit, parse_system_headroom},
 };
 
 /// The serving option that routes every peer over subnets every rank holds.
@@ -857,6 +857,12 @@ pub struct ServingOptions {
     )]
     pub memory_limit: Option<MemoryLimit>,
 
+    /// Memory left to the rest of the system by cache sizing on unified-memory GPUs and by host
+    /// prefix-cache budgets, e.g. 4G; 0 leaves none [default: memory.system_headroom, else a
+    /// twentieth of memory].
+    #[arg(long, value_name = "SIZE", value_parser = parse_system_headroom, help_heading = "Serving options")]
+    pub system_headroom: Option<u64>,
+
     /// Route RoCE rails and fabric transfers only over subnets every rank holds, as on a switch
     /// alone, leaving direct cables between ranks unused.
     #[arg(long, help_heading = "Multi-host options")]
@@ -1066,6 +1072,9 @@ impl ServingOptions {
         if let Some(limit) = self.memory_limit {
             options.push(format!("--memory-limit={limit}"));
         }
+        if let Some(bytes) = self.system_headroom {
+            options.extend(["--system-headroom".into(), bytes.to_string()]);
+        }
         match shape {
             Shape::Mesh => {}
             Shape::Ring => options.push("--roce-ring".into()),
@@ -1172,6 +1181,7 @@ impl ServingOptions {
         LoadOptions {
             kv_cache_limit: self.kv_cache_limit,
             memory_limit: self.memory_limit,
+            system_headroom_bytes: self.system_headroom,
             embedding_table_storage: self.embedding_table_storage,
             embedding_table_cache_bytes: self.embedding_table_cache_size,
             embedding_table_resident_scales: if self.embedding_table_resident_scales {
@@ -1290,6 +1300,8 @@ mod tests {
                     "memory",
                     "--embedding-table-cache-size",
                     "0",
+                    "--system-headroom",
+                    "0",
                     "--gpus",
                     "0",
                 ]);
@@ -1329,6 +1341,8 @@ mod tests {
                 "context".into(),
                 "--embedding-table-cache-size".into(),
                 "1G".into(),
+                "--system-headroom".into(),
+                "4G".into(),
             ];
             saved.extend(orbit.rank_options(run_matches));
             saved.extend(orbit.rank_zero_options());
@@ -1377,6 +1391,10 @@ mod tests {
             assert_eq!(
                 effective.serving.embedding_table_cache_size,
                 Some(if explicit { 0 } else { 1 << 30 })
+            );
+            assert_eq!(
+                effective.serving.system_headroom,
+                Some(if explicit { 0 } else { 4 << 30 })
             );
             assert_eq!(
                 run_matches.value_source("gpus") == Some(clap::parser::ValueSource::CommandLine),
@@ -1500,6 +1518,7 @@ mod tests {
         assert_eq!(options.max_concurrency, None);
         assert_eq!(options.kv_cache_limit, KvCacheLimit::Memory);
         assert_eq!(options.memory_limit, None);
+        assert_eq!(options.system_headroom_bytes, None);
         assert_eq!(options.mtp_draft_tokens, None);
         assert_eq!(options.history_drafts, None);
         assert_eq!(options.mtp_verification_token_budget, None);
@@ -2255,6 +2274,51 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn system_headroom_accepts_sizes_including_zero_and_reaches_every_rank() {
+        let omitted = run(&["flare", "run", "model.safetensors"]);
+        assert!(
+            !omitted
+                .rank_options()
+                .contains(&"--system-headroom".to_owned())
+        );
+        for (value, bytes) in [
+            ("4G", 4u64 << 30),
+            ("1.5GiB", 3 << 29),
+            ("1m", 1 << 20),
+            ("0", 0),
+        ] {
+            for flags in [
+                vec!["--system-headroom".to_owned(), value.to_owned()],
+                vec![format!("--system-headroom={value}")],
+            ] {
+                let mut arguments = vec!["flare", "run", "model.safetensors", "--memory-limit=-1G"];
+                arguments.extend(flags.iter().map(String::as_str));
+                let args = run(&arguments);
+                assert_eq!(args.load_options().system_headroom_bytes, Some(bytes));
+                let forwarded = args.rank_options();
+                let mut peer = vec!["flare", "run", "model.safetensors"];
+                peer.extend(forwarded.iter().map(String::as_str));
+                let peer = run(&peer).load_options();
+                assert_eq!(peer.system_headroom_bytes, Some(bytes));
+                assert_eq!(peer.memory_limit, args.load_options().memory_limit);
+            }
+        }
+        // A size below 1 MiB other than zero is a fraction or a byte count given by mistake.
+        for value in ["", "many", "1X", "-1G", "0.5.5G", "0.05", "6", "1023K"] {
+            assert!(
+                Cli::try_parse_from([
+                    "flare",
+                    "run",
+                    "model.safetensors",
+                    &format!("--system-headroom={value}")
+                ])
+                .is_err(),
+                "{value}"
+            );
+        }
     }
 }
 

@@ -95,6 +95,24 @@ speculative_token_capacity = 8
     assert configuration.model_setting("qwen3.8-flash", "speculative_token_capacity", None, 16).value == 16
 
 
+def test_system_headroom_is_a_validated_serving_setting(tmp_path):
+    assert load(tmp_path, "").get("memory.system_headroom") == Setting("", "default")
+    for value in ("", "0", "0G", "1M", "4G", "1.5GiB"):
+        configuration = load(tmp_path, f'[memory]\nreserve = "1G"\nsystem_headroom = "{value}"\n')
+        assert configuration.get("memory.system_headroom") == Setting(value, "[memory]")
+        assert configuration.reserve_bytes == 1 << 30
+
+
+def test_initial_file_lists_memory_settings_as_comments_and_loads(tmp_path):
+    path = tmp_path / "config.toml"
+    Configuration(path, {}, False).write_initial("qwen3.8-flash", 4)
+    text = path.read_text()
+    assert '# reserve = "0"' in text and '# system_headroom = ""' in text
+    configuration = Configuration.load(path)
+    assert configuration.reserve_bytes == 0
+    assert configuration.get("memory.system_headroom") == Setting("", "default")
+
+
 def test_prefix_cache_settings_validate(tmp_path):
     configuration = load(tmp_path, "[prefix_cache]\nmemory = \"4G\"\n")
     assert configuration.get("prefix_cache.memory") == Setting("4G", "[prefix_cache]")
@@ -168,6 +186,13 @@ def test_compiler_worker_flag_overrides_configured_host_budget(tmp_path):
     ("[memory]\nconversation_cache = 16\n", "unknown key conversation_cache"),
     ("[memory]\nreserve = \"lots\"\n", "memory size"),
     ("[memory]\nreserve = 16\n", "must be str"),
+    ("[memory]\nsystem_headroom = \"lots\"\n", "memory system_headroom"),
+    ("[memory]\nsystem_headroom = \"-1G\"\n", "memory system_headroom"),
+    ("[memory]\nsystem_headroom = 4\n", "must be str"),
+    ("[memory]\nsystem_headroom = \" \"\n", "memory system_headroom"),
+    ("[memory]\nsystem_headroom = \"0.05\"\n", 'is below 1 MiB; give a size with a suffix, such as "4G", or 0$'),
+    ("[memory]\nsystem_headroom = \"6\"\n", "below 1 MiB"),
+    ("[memory]\nsystem_headroom = \"1023K\"\n", "below 1 MiB"),
     ("[models.\"qwen3.8-flash\"]\ncontext = 4096\n", "unknown key context"),
     ("server = 3\n", "must be a table"),
     ("[server\n", "config.toml"),

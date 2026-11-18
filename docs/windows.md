@@ -203,7 +203,9 @@ system commit limit: CPU-visible RAM plus the page files. Windows grows a
 system-managed page file on demand up to a maximum it chooses, about three times
 RAM. Serving sizes caches from the smaller of CUDA's free memory and the commit the
 process can obtain once every page file reaches its maximum size, then subtracts the
-configured reserve, driver margin, and integrated-GPU host headroom, so the reserve
+configured reserve, driver margin, and the integrated-GPU host allowance and
+system headroom (`[memory] system_headroom`, or `--system-headroom` with
+`flare run`), so the reserve
 is available to other processes as commit. Page-file capacity is not GPU
 memory, but it bounds GPU allocations: when RAM plus the maximum page-file size is
 smaller than the server's footprint plus other processes' commit, KV capacity

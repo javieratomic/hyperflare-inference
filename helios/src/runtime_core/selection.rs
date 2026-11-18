@@ -17,6 +17,9 @@ use crate::{Result, execution::BATCH_CAPACITIES};
 pub struct LoadOptions {
     pub kv_cache_limit: super::KvCacheLimit,
     pub memory_limit: Option<super::MemoryLimit>,
+    /// Bytes that integrated-GPU cache sizing and host prefix-cache budgets leave to the rest
+    /// of the system; absent keeps a twentieth of memory.
+    pub system_headroom_bytes: Option<u64>,
     /// Auxiliary embedding-table storage; defaults to disk when absent.
     pub embedding_table_storage: Option<crate::engram::Storage>,
     /// Per-host RAM bytes for disk-backed embedding rows; zero disables, absent selects by memory topology.

@@ -23,8 +23,7 @@ const HEADROOM_BYTES: u64 = 64 << 20;
 // the server's host allocations made after sizing: frontend workers, tokenizers and request
 // buffers took about 1.4 GiB on a DGX Spark. Caches leave room for both beyond the reserve.
 use flare_selene::offload::{
-    HOST_SERVICE_HEADROOM_BYTES as INTEGRATED_HOST_BYTES,
-    HOST_SYSTEM_SHARE as INTEGRATED_SYSTEM_SHARE,
+    HOST_SERVICE_HEADROOM_BYTES as INTEGRATED_HOST_BYTES, system_headroom,
 };
 
 #[cfg(any(unix, test))]
@@ -178,10 +177,11 @@ fn headroom(config: &serde_json::Value) -> Result<u64> {
 }
 
 /// Memory caches may use on one rank: free memory less the headroom, and on an integrated GPU
-/// also the server's later host allocations and a twentieth of memory for the system.
-fn budget(free: u64, total: u64, headroom: u64, integrated: bool) -> u64 {
+/// also the server's later host allocations and the system headroom, which is `system` bytes
+/// when set and otherwise a twentieth of memory.
+fn budget(free: u64, total: u64, headroom: u64, integrated: bool, system: Option<u64>) -> u64 {
     let host = if integrated {
-        INTEGRATED_HOST_BYTES + total / INTEGRATED_SYSTEM_SHARE
+        INTEGRATED_HOST_BYTES.saturating_add(system_headroom(total, system))
     } else {
         0
     };
@@ -239,6 +239,7 @@ fn limited_budget(
     default_headroom: u64,
     integrated: bool,
     future: u64,
+    system: Option<u64>,
 ) -> Result<u64> {
     let headroom = match limit {
         None => default_headroom,
@@ -247,11 +248,26 @@ fn limited_budget(
             .ok_or_else(|| invalid("memory reserve overflows the device budget"))?,
         Some(_) => HEADROOM_BYTES,
     };
+    // The capacity errors that follow report only the bytes left, so a configured system
+    // headroom that takes the whole supply is refused here by name.
+    let supply = budget(
+        memory.free.min(memory.total),
+        memory.total,
+        headroom,
+        integrated,
+        Some(0),
+    );
+    if let Some(bytes) = system.filter(|&bytes| integrated && supply != 0 && bytes >= supply) {
+        return Err(invalid(format!(
+            "system headroom is {bytes} bytes, but only {supply} bytes are free after the driver margin, any reserve and the host allowance"
+        )));
+    }
     let available = budget(
         memory.free.min(memory.total),
         memory.total,
         headroom,
         integrated,
+        system,
     )
     .saturating_sub(future);
     let Some(cap) = limit.and_then(|limit| limit.occupied_bytes(memory.total)) else {
@@ -491,8 +507,27 @@ fn capacities(
     Ok((execution + cached, low, cached))
 }
 
+/// Whether a setting can be refused before the model's storage loads: an occupied limit, or
+/// a configured system headroom.
+fn checked_before_loading(options: &LoadOptions) -> bool {
+    matches!(
+        options.memory_limit,
+        Some(MemoryLimit::Bytes(_) | MemoryLimit::Fraction(_))
+    ) || options.system_headroom_bytes.is_some()
+}
+
+/// The cache plan's system headroom entry, present when the setting is given and bounds a
+/// budget: cache sizing on an integrated GPU, or the host prefix-cache budgets.
+fn system_headroom_entry(options: &LoadOptions, integrated: bool) -> Option<String> {
+    options
+        .system_headroom_bytes
+        .filter(|_| integrated || options.prefix_cache.enabled())
+        .map(|bytes| format!(" · system headroom {}", MemoryLimit::Bytes(bytes)))
+}
+
 impl NativeModel {
-    /// Refuse an occupied limit smaller than the known fixed model storage before loading it.
+    /// Refuse, before loading the model's storage, an occupied limit smaller than the known
+    /// fixed storage and a configured system headroom that takes the whole supply.
     pub(super) unsafe fn check_memory_limit(
         &self,
         cores: &[Core],
@@ -500,10 +535,7 @@ impl NativeModel {
         initial: &[MemorySnapshot],
         embedding_host_bytes: u64,
     ) -> Result<()> {
-        if !matches!(
-            options.memory_limit,
-            Some(MemoryLimit::Bytes(_) | MemoryLimit::Fraction(_))
-        ) {
+        if !checked_before_loading(options) {
             return Ok(());
         }
         for ((rank, core), &memory) in self.ranks.iter().zip(cores).zip(initial) {
@@ -538,6 +570,7 @@ impl NativeModel {
                 headroom(&self.server_config)?,
                 rank.integrated,
                 0,
+                options.system_headroom_bytes,
             )?;
         }
         Ok(())
@@ -622,6 +655,7 @@ impl NativeModel {
                 &flare_selene::Layout::new(&geometry)?,
                 active,
                 staging != 0,
+                options.system_headroom_bytes,
             )?;
             let index = if staging == 0 {
                 0
@@ -700,6 +734,7 @@ impl NativeModel {
                     reserve,
                     rank.integrated,
                     future,
+                    options.system_headroom_bytes,
                 )? / share,
             );
             loaded_bytes.push(loaded / share);
@@ -762,8 +797,9 @@ impl NativeModel {
                 page_tokens,
                 ceiling,
             )?;
-            let host = flare_selene::offload::host_pool_budget(host_future)
-                .map_err(|error| error.to_string());
+            let host =
+                flare_selene::offload::host_pool_budget(host_future, options.system_headroom_bytes)
+                    .map_err(|error| error.to_string());
             let budget = crate::offload::pool::Budget {
                 host,
                 devices: available
@@ -859,6 +895,9 @@ impl NativeModel {
             MemoryLimit::Fraction(fraction) => {
                 summary.push_str(&format!(" · limit {}% of GPU memory", fraction * 100.0));
             }
+        }
+        if let Some(entry) = system_headroom_entry(options, integrated != 0) {
+            summary.push_str(&entry);
         }
         match options.kv_cache_limit {
             KvCacheLimit::Memory => {}
@@ -1160,11 +1199,17 @@ mod tests {
     #[test]
     fn integrated_gpus_keep_host_memory_for_the_server_beyond_the_reserve() {
         let gib = 1u64 << 30;
-        assert_eq!(budget(40 * gib, 120 * gib, 5 * gib, false), 35 * gib);
+        assert_eq!(budget(40 * gib, 120 * gib, 5 * gib, false, None), 35 * gib);
         // Two GiB for the server and a twentieth of memory for the system.
-        assert_eq!(budget(40 * gib, 120 * gib, 5 * gib, true), 27 * gib);
-        assert_eq!(budget(40 * gib, 120 * gib, 0, true), 32 * gib);
-        assert_eq!(budget(6 * gib, 120 * gib, 0, true), 0);
+        assert_eq!(budget(40 * gib, 120 * gib, 5 * gib, true, None), 27 * gib);
+        assert_eq!(budget(40 * gib, 120 * gib, 0, true, None), 32 * gib);
+        assert_eq!(budget(6 * gib, 120 * gib, 0, true, None), 0);
+        // A configured system headroom replaces the twentieth, including zero, and discrete
+        // GPUs keep none.
+        assert_eq!(budget(40 * gib, 120 * gib, 0, true, Some(gib)), 37 * gib);
+        assert_eq!(budget(40 * gib, 120 * gib, 0, true, Some(0)), 38 * gib);
+        assert_eq!(budget(40 * gib, 120 * gib, 0, true, Some(u64::MAX)), 0);
+        assert_eq!(budget(40 * gib, 120 * gib, 0, false, Some(gib)), 40 * gib);
     }
 
     #[test]
@@ -1176,7 +1221,7 @@ mod tests {
         };
         let legacy = 5 * gib + HEADROOM_BYTES;
         assert_eq!(
-            limited_budget(memory, 20 * gib, None, legacy, false, 0).unwrap(),
+            limited_budget(memory, 20 * gib, None, legacy, false, 0, None).unwrap(),
             35 * gib - HEADROOM_BYTES
         );
         // An explicit flag replaces the core reserve, including for occupied limits.
@@ -1187,7 +1232,8 @@ mod tests {
                 Some(MemoryLimit::Bytes(30 * gib)),
                 legacy,
                 false,
-                gib
+                gib,
+                None
             )
             .unwrap(),
             9 * gib - HEADROOM_BYTES
@@ -1199,7 +1245,8 @@ mod tests {
                 Some(MemoryLimit::Fraction(0.5)),
                 legacy,
                 false,
-                0
+                0,
+                None
             )
             .unwrap(),
             30 * gib - HEADROOM_BYTES
@@ -1211,7 +1258,8 @@ mod tests {
                 Some(MemoryLimit::Reserve(10 * gib)),
                 legacy,
                 false,
-                0
+                0,
+                None
             )
             .unwrap(),
             30 * gib - HEADROOM_BYTES
@@ -1228,7 +1276,8 @@ mod tests {
                 Some(MemoryLimit::Bytes(80 * gib)),
                 legacy,
                 false,
-                0
+                0,
+                None
             )
             .unwrap(),
             gib - HEADROOM_BYTES
@@ -1240,7 +1289,8 @@ mod tests {
                 Some(MemoryLimit::Bytes(30 * gib)),
                 legacy,
                 false,
-                0
+                0,
+                None
             )
             .is_err()
         );
@@ -1251,7 +1301,8 @@ mod tests {
                 Some(MemoryLimit::Reserve(u64::MAX)),
                 legacy,
                 false,
-                0
+                0,
+                None
             )
             .is_err()
         );
@@ -1272,14 +1323,15 @@ mod tests {
                 Some(MemoryLimit::Bytes(40 * gib)),
                 HEADROOM_BYTES,
                 true,
-                8 * gib
+                8 * gib,
+                None
             )
             .unwrap(),
             10 * gib - HEADROOM_BYTES
         );
-        // Without an occupied cap, retain the five-percent system margin too.
+        // Without an occupied cap, retain the default system headroom too.
         assert_eq!(
-            limited_budget(memory, 20 * gib, None, HEADROOM_BYTES, true, 8 * gib).unwrap(),
+            limited_budget(memory, 20 * gib, None, HEADROOM_BYTES, true, 8 * gib, None).unwrap(),
             45 * gib - HEADROOM_BYTES
         );
         let plentiful = MemorySnapshot {
@@ -1287,8 +1339,114 @@ mod tests {
             ..memory
         };
         assert_eq!(
-            limited_budget(plentiful, 0, None, HEADROOM_BYTES, true, 0).unwrap(),
+            limited_budget(plentiful, 0, None, HEADROOM_BYTES, true, 0, None).unwrap(),
             93 * gib - HEADROOM_BYTES
+        );
+    }
+
+    #[test]
+    fn configured_system_headroom_replaces_the_twentieth_under_every_limit() {
+        let gib = 1u64 << 30;
+        let memory = MemorySnapshot {
+            free: 30 * gib,
+            total: 100 * gib,
+        };
+        let available = |limit, integrated, system| {
+            limited_budget(
+                memory,
+                10 * gib,
+                limit,
+                HEADROOM_BYTES,
+                integrated,
+                0,
+                system,
+            )
+            .unwrap()
+        };
+        // Free memory less the 2 GiB server host allowance, the driver margin, any reserve,
+        // and the system headroom: 5 GiB of this total by default, otherwise the configured
+        // bytes.
+        for (limit, reserve) in [
+            (None, 0),
+            (Some(MemoryLimit::Reserve(4 * gib)), 4 * gib),
+            (Some(MemoryLimit::Bytes(60 * gib)), 0),
+            (Some(MemoryLimit::Fraction(0.5)), 0),
+        ] {
+            let supply = 28 * gib - HEADROOM_BYTES - reserve;
+            assert_eq!(available(limit, true, None), supply - 5 * gib);
+            assert_eq!(available(limit, true, Some(5 * gib)), supply - 5 * gib);
+            assert_eq!(available(limit, true, Some(gib)), supply - gib);
+            assert_eq!(available(limit, true, Some(0)), supply);
+            assert_eq!(available(limit, true, Some(supply - 1)), 1);
+            // A headroom that takes the whole supply is refused by name.
+            for system in [supply, u64::MAX] {
+                let error = limited_budget(
+                    memory,
+                    10 * gib,
+                    limit,
+                    HEADROOM_BYTES,
+                    true,
+                    0,
+                    Some(system),
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(error.contains("system headroom is"), "{error}");
+            }
+        }
+        // System headroom is unoccupied memory: lowering it does not raise an occupied cap
+        // that already binds.
+        let capped = Some(MemoryLimit::Bytes(20 * gib));
+        assert_eq!(available(capped, true, None), 8 * gib - HEADROOM_BYTES);
+        assert_eq!(available(capped, true, Some(0)), 8 * gib - HEADROOM_BYTES);
+        // Discrete GPUs keep no system headroom, configured or not.
+        assert_eq!(available(None, false, None), 30 * gib - HEADROOM_BYTES);
+        assert_eq!(available(None, false, Some(gib)), 30 * gib - HEADROOM_BYTES);
+        assert_eq!(
+            available(None, false, Some(u64::MAX)),
+            30 * gib - HEADROOM_BYTES
+        );
+        // With nothing free the headroom is not the cause, so it is not refused by name.
+        let exhausted = MemorySnapshot {
+            free: 2 * gib,
+            ..memory
+        };
+        for system in [Some(0), Some(gib)] {
+            assert_eq!(
+                limited_budget(exhausted, 0, None, HEADROOM_BYTES, true, 0, system).unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn a_configured_system_headroom_is_checked_before_loading_and_shown_where_it_applies() {
+        let headroom = |bytes| LoadOptions {
+            system_headroom_bytes: bytes,
+            ..Default::default()
+        };
+        assert!(!checked_before_loading(&headroom(None)));
+        assert!(checked_before_loading(&headroom(Some(0))));
+        assert!(checked_before_loading(&LoadOptions {
+            memory_limit: Some(MemoryLimit::Fraction(0.5)),
+            ..Default::default()
+        }));
+        assert!(!checked_before_loading(&LoadOptions {
+            memory_limit: Some(MemoryLimit::Reserve(1 << 30)),
+            ..Default::default()
+        }));
+        // The cache plan shows the setting on an integrated GPU, and on a discrete GPU only
+        // with a host prefix cache, whose budgets it bounds there.
+        let shown = Some(" · system headroom 2GiB".to_owned());
+        assert_eq!(system_headroom_entry(&headroom(None), true), None);
+        assert_eq!(system_headroom_entry(&headroom(Some(2 << 30)), true), shown);
+        assert_eq!(system_headroom_entry(&headroom(Some(2 << 30)), false), None);
+        let mut cached = headroom(Some(2 << 30));
+        cached.prefix_cache.memory_bytes = Some(1 << 30);
+        assert_eq!(system_headroom_entry(&cached, false), shown);
+        assert_eq!(
+            system_headroom_entry(&headroom(Some(0)), true),
+            Some(" · system headroom 0KiB".to_owned())
         );
     }
 
@@ -1476,7 +1634,7 @@ mod tests {
             Some(MemoryLimit::Fraction(0.5)),
         ] {
             let available =
-                limited_budget(memory, 4 * gib, limit, HEADROOM_BYTES, false, 0).unwrap();
+                limited_budget(memory, 4 * gib, limit, HEADROOM_BYTES, false, 0, None).unwrap();
             let before = capacities(&cores, &[available], 1, 1, 64, None).unwrap();
             let budget = crate::offload::pool::Budget {
                 host: Ok(32 * gib),
@@ -1601,7 +1759,8 @@ mod tests {
                     Some(MemoryLimit::Bytes(loaded)),
                     0,
                     owner.integrated,
-                    0
+                    0,
+                    None
                 )
                 .is_err()
             );
@@ -1620,7 +1779,8 @@ mod tests {
                     Some(MemoryLimit::Bytes(cap)),
                     0,
                     owner.integrated,
-                    0
+                    0,
+                    None
                 )
                 .unwrap(),
                 16 << 20

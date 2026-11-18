@@ -734,6 +734,7 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--max-concurrency N` | Reduce concurrency within captured batch capacities | Model/default configuration, otherwise core default |
 | `--kv-cache-limit concurrency\|context\|memory` | Bound shared KV history by prepared context times selected concurrency, one prepared context, or available memory | `memory` |
 | `--memory-limit LIMIT` | Per-GPU occupied size (`30G`), free-memory reserve (`-30G`, including `-0G`), or fraction of total memory (`0.8`) | `[memory] reserve`, otherwise core serving reserve |
+| `--system-headroom SIZE` | Memory left to the rest of the system by cache sizing on unified-memory GPUs and by host prefix-cache budgets; accepts sizes such as `4G`; `0` leaves none, and other sizes below `1M` are rejected | `[memory] system_headroom`, otherwise a twentieth of memory |
 | `--mtp-draft-tokens N` | Reduce the maximum draft count; zero selects ordinary execution without draft generation, absorption, or draft-state maintenance | Core default |
 | `--mtp-adaptive-verification` / `--no-mtp-adaptive-verification` | Adaptive or fixed selection among captured widths | Core default |
 | `--history-drafts` / `--no-history-drafts` | Augment learned drafts with shared decoded-history continuations; requires enabled speculation and captured history inputs, as Qwen Flash provides | Off; core defaults apply unless overridden |
@@ -859,6 +860,35 @@ resources fails before loading those resources. The loader reconciles observed
 startup consumption after graph upload and before allocating cache backing.
 Discrete occupied/fraction limits use NVIDIA NVML to observe memory before
 CUDA context creation; Linux integrated devices use `MemAvailable` instead.
+
+The system headroom is memory an integrated GPU leaves unoccupied for the
+operating system and other processes, beyond the 64 MiB driver margin, the
+2 GiB allowance for the server's later host allocations, and any reserve. It
+defaults to a twentieth of the device total that CUDA reports.
+`--system-headroom SIZE` replaces that twentieth with a size such as `4G`,
+using the same binary suffixes. `--system-headroom 0` leaves none; any other
+size below 1 MiB is rejected, so a fraction such as `0.05` is not read as
+bytes. KV pages receive the difference, so, while memory bounds the pool, a
+smaller headroom enlarges the page pool and a larger one shrinks it. A headroom
+that leaves less than the minimum pool fails startup. One at least as large as
+the memory free after the driver margin, any reserve and the host allowance is
+refused by name: before the model's storage loads when it already takes all the
+memory free at that point, otherwise when caches are sized. Pools are fixed at
+startup, and the headroom also absorbs the server's own host allocations beyond
+the 2 GiB allowance. With a small or zero headroom, later demand from the
+server, the operating system or other processes can be met only by reclaim,
+swap, or the out-of-memory killer, any of which can stall or kill the Flare
+process itself. Because the headroom is unoccupied memory, an occupied limit
+does not count it: lowering the headroom raises capacity only while free
+memory, not the occupied limit, bounds the pool. The same setting bounds the
+host memory budgeted for registered prefix-cache intake and pool staging, on
+integrated and discrete GPUs alike; that budget's default is a twentieth of the
+host's physical memory. Cache sizing on a discrete GPU keeps no system
+headroom, and the setting does not change it. A headroom that leaves no host
+budget is not refused on a discrete GPU: intake shrinks to its two-window
+minimum and a pool is refused, each with a warning that names the host budget
+and not the headroom. The load display's cache plan reports the setting when it
+is given and either a GPU is integrated or the host prefix cache is enabled.
 
 These are startup sizing budgets, not OS-enforced quotas. Pools stay fixed
 during serving; Flare does not resize them as other processes allocate memory.
@@ -1257,7 +1287,7 @@ file or an invalid runtime setting is an error. Help does not read the file.
 
 Native `flare run` applies `[server] host`, `port`, `api_key`, `thinking_token_budget`,
 and `scheduler_checkpoint_extra_work_fraction`,
-`[memory] reserve`, `[defaults] max_concurrency`, `[models.<name>] max_concurrency`, all `[prefix_cache]`
+`[memory] reserve` and `system_headroom`, `[defaults] max_concurrency`, `[models.<name>] max_concurrency`, all `[prefix_cache]`
 settings, and `[paths] prefix_cache`. Prepared-model acquisition and cache commands
 use `[paths] core_cache`. Flags override these defaults, including explicit
 zero limits and values equal to the built-in defaults. An empty `--api-key-file`
@@ -1303,6 +1333,7 @@ max_concurrency = 4
 
 [memory]
 reserve = "0"                     # GPU memory left for processes started later.
+system_headroom = ""              # Memory left to the system by unified-memory GPU caches and host prefix-cache budgets; empty: a twentieth of total memory.
 
 [prefix_cache]
 memory = ""                      # Warm checkpoints and CPU inputs; empty or 0: no warm tier. Intake is additional.
@@ -1358,6 +1389,31 @@ setting, because supply is free memory rather than card size. Preparation record
 it as the core's serving reserve. Native serving uses an explicit host configuration
 value in preference to that recorded reserve.
 
+`memory.system_headroom` exists for one case: a serving host whose operating
+system and other processes need less than the default twentieth; the twentieth
+then withholds memory the page pool could use. To leave more memory free, set
+`memory.reserve`: on an integrated GPU it is subtracted from the same supply,
+and it is the setting for memory that processes started later will occupy. A
+larger `system_headroom` is accepted and, unlike a reserve, also shrinks the
+host prefix-cache budgets. A size below what the host needs leaves that demand
+to reclaim, swap, or the out-of-memory killer, as
+[runtime memory limits](#runtime-memory-limits) describes. The key is not
+recorded in a core, and across hosts it is applied as `memory.reserve` is.
+`flare run` applies the key of the host it runs on unless `--system-headroom`
+is given. `flare run --hosts` forwards the size rank zero resolved, from its
+flag or its key, to every peer, where it replaces the peer's key; when rank
+zero resolves none it forwards none, and each peer applies its own key. A peer
+that needs more headroom than rank zero's host is therefore sized with rank
+zero's smaller value: give rank zero a size that covers the neediest host, or
+give that peer a `memory.reserve`, which applies only while rank zero resolves
+no memory limit. `flare orbit run` does not apply the controller's key: each
+node applies its own unless the command line or the saved group gives the flag.
+Ranks sized with different headrooms agree on the smallest capacity. An empty
+value keeps the default twentieth. No flag value selects the default: once a
+size is set, the twentieth returns only when the key is emptied or removed, or
+when the flag is deleted from the `serving` words of the group in the
+controller's orbit file. Ignition validates the key and does not use it.
+
 The GPU prefix cache is derived. It holds model states at instruction,
 prompt, and answer boundaries so that later requests repeating a prefix skip
 recomputing it. Immutable snapshot capacity is bounded by borrowable KV backing
@@ -1385,6 +1441,7 @@ Configuration assigns each decision to one owner:
 | KV pages and GPU prefix-cache rows | Derived from available memory, graph cost, and concurrency |
 | KV history ceiling | Runtime `--kv-cache-limit` |
 | Serving memory budget | Runtime `--memory-limit`, then configured `[memory] reserve`, then the core reserve |
+| System headroom on unified-memory GPUs and host prefix-cache budgets | Runtime `--system-headroom`, then configured `[memory] system_headroom`, otherwise a twentieth of memory |
 | Preparation headroom | 1 GiB for compiled warmup and capture, plus 128 KiB per effective prefill token above 4096, including mixed prompt/decode rows |
 | Serving driver margin | 64 MiB after graph upload |
 | Prefill chunk | Recipe default, overridden by `--prefill-chunk-size` |

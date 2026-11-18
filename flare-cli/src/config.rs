@@ -19,7 +19,7 @@ use flare_helios::{
 use crate::cli;
 
 pub use flare::configuration::expand;
-use flare::configuration::{nonempty, size};
+use flare::configuration::{nonempty, size, system_headroom};
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 #[derive(Default)]
 pub(crate) struct Configuration(flare::configuration::Configuration);
@@ -74,6 +74,10 @@ impl Configuration {
                 if serving.memory_limit.is_none() {
                     serving.memory_limit = size(self.memory.reserve.as_deref(), "memory.reserve")?
                         .map(MemoryLimit::Reserve);
+                }
+                if serving.system_headroom.is_none() {
+                    serving.system_headroom =
+                        system_headroom(self.memory.system_headroom.as_deref())?;
                 }
                 if serving.prefix_cache_memory.is_none() {
                     serving.prefix_cache_memory = size(
@@ -312,6 +316,7 @@ api_key = "configured-secret"
 thinking_token_budget = 1536
 [memory]
 reserve = "2G"
+system_headroom = "3G"
 [defaults]
 max_concurrency = 8
 model = "preparation-recipe"
@@ -348,6 +353,7 @@ namespace = "publisher"
         assert_eq!(config.api_key(None).unwrap(), "configured-secret");
         assert_eq!(config.thinking_token_budget(), Some(1536));
         assert_eq!(run.memory_limit, Some(MemoryLimit::Reserve(2 << 30)));
+        assert_eq!(run.system_headroom, Some(3 << 30));
         assert_eq!(run.max_concurrency.unwrap().get(), 4);
         assert_eq!(run.prefix_cache_memory, Some(3 << 29));
         assert_eq!(run.prefix_cache_disk_limit, Some(20 << 30));
@@ -362,6 +368,7 @@ namespace = "publisher"
         let options = run.load_options();
         assert_eq!(options.max_concurrency, Some(4));
         assert_eq!(options.memory_limit, run.memory_limit);
+        assert_eq!(options.system_headroom_bytes, Some(3 << 30));
         assert!(run.mtp_max_verification_token_budget.is_none());
         assert!(run.mtp_verification_token_budget.is_none());
     }
@@ -380,6 +387,8 @@ namespace = "publisher"
                 "8000",
                 "--memory-limit",
                 "0.8",
+                "--system-headroom",
+                "0",
                 "--max-concurrency",
                 "2",
                 "--prefix-cache-memory",
@@ -395,6 +404,7 @@ namespace = "publisher"
         );
         assert_eq!(run.bind_address().to_string(), "127.0.0.1:8000");
         assert_eq!(run.memory_limit, Some(MemoryLimit::Fraction(0.8)));
+        assert_eq!(run.system_headroom, Some(0));
         assert_eq!(run.max_concurrency.unwrap().get(), 2);
         assert_eq!(run.prefix_cache_memory, Some(0));
         assert_eq!(run.prefix_cache_disk_limit, Some(0));
@@ -412,6 +422,7 @@ namespace = "publisher"
     fn empty_configuration_preserves_core_defaults() {
         let (config, run) = configured("", &["flare", "run", "model"], &["recipe"]);
         assert!(run.memory_limit.is_none());
+        assert!(run.system_headroom.is_none());
         assert!(run.max_concurrency.is_none());
         assert!(run.prefix_cache_disk.is_none());
         assert!(run.prefix_cache_memory.is_none());
@@ -419,6 +430,9 @@ namespace = "publisher"
         assert_eq!(run.bind_address().to_string(), "127.0.0.1:8000");
         assert_eq!(config.api_key(None).unwrap(), "");
         assert_eq!(config.thinking_token_budget(), None);
+        let blank = "[memory]\nsystem_headroom=''";
+        let (_, run) = configured(blank, &["flare", "run", "model"], &[]);
+        assert!(run.system_headroom.is_none());
     }
 
     #[test]
@@ -504,6 +518,13 @@ namespace = "publisher"
             "[models.recipe]\nmax_concurrency=-1",
             "[memory]\nreserve='-1G'",
             "[memory]\nreserve=''",
+            "[memory]\nsystem_headroom='-1G'",
+            "[memory]\nsystem_headroom='many'",
+            "[memory]\nsystem_headroom=' '",
+            "[memory]\nsystem_headroom='0.05'",
+            "[memory]\nsystem_headroom='6'",
+            "[memory]\nsystem_headroom='1023K'",
+            "[memory]\nsystem_headroom=4",
             "[prefix_cache]\nmemory='many'",
             "[prefix_cache]\ndisk_limit='-1'",
             "[prefix_cache]\ndisk_transport='invalid'",
@@ -521,6 +542,7 @@ namespace = "publisher"
         for text in [
             SETTINGS.to_owned(),
             SETTINGS.replace("reserve = \"2G\"", "reserve = \"0\""),
+            SETTINGS.replace("system_headroom = \"3G\"", "system_headroom = \"0\""),
         ] {
             let (_, root) = configured(&text, &["flare", "run", "model"], &["recipe"]);
             let mut argv = vec![
@@ -534,11 +556,54 @@ namespace = "publisher"
                 panic!()
             };
             assert_eq!(peer.memory_limit, root.memory_limit);
+            assert!(root.system_headroom.is_some());
+            assert_eq!(peer.system_headroom, root.system_headroom);
             assert_eq!(peer.max_concurrency, root.max_concurrency);
             assert_eq!(peer.prefix_cache_memory, root.prefix_cache_memory);
             assert_eq!(peer.prefix_cache_disk, root.prefix_cache_disk);
             assert_eq!(peer.prefix_cache_disk_limit, root.prefix_cache_disk_limit);
         }
+    }
+
+    #[test]
+    fn peers_apply_rank_zeros_memory_settings_before_their_own_keys() {
+        let peer_keys = "[memory]\nreserve = \"1G\"\nsystem_headroom = \"1G\"";
+        let root_keys = "[memory]\nreserve = \"2G\"\nsystem_headroom = \"3G\"";
+        // Rank zero forwards what its flags or keys resolved; a peer's keys apply only to
+        // the settings rank zero left unset.
+        for (keys, reserve, headroom) in
+            [(root_keys, 2u64 << 30, 3u64 << 30), ("", 1 << 30, 1 << 30)]
+        {
+            let (_, root) = configured(keys, &["flare", "run", "model"], &[]);
+            let mut argv = vec![
+                "flare".to_owned(),
+                "run".into(),
+                "--rank".into(),
+                "1".into(),
+            ];
+            argv.extend(root.rank_options());
+            let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+            let (_, peer) = configured(peer_keys, &argv, &[]);
+            assert_eq!(peer.memory_limit, Some(MemoryLimit::Reserve(reserve)));
+            assert_eq!(peer.system_headroom, Some(headroom));
+        }
+        // An Orbit controller applies neither key: each node reads its own configuration.
+        let matches = cli::Cli::command()
+            .try_get_matches_from(["flare", "orbit", "run", "model"])
+            .unwrap();
+        let mut cli = cli::Cli::from_arg_matches(&matches).unwrap();
+        Configuration::parse(root_keys)
+            .unwrap()
+            .apply(&mut cli, &matches, Path::new("/home/test"))
+            .unwrap();
+        let cli::Command::Orbit(orbit) = cli.command else {
+            panic!()
+        };
+        let cli::OrbitCommand::Run(orbit) = orbit.command else {
+            panic!()
+        };
+        assert!(orbit.serving.memory_limit.is_none());
+        assert!(orbit.serving.system_headroom.is_none());
     }
 
     #[test]

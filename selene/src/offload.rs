@@ -55,12 +55,14 @@ impl PrefixCacheOffload {
             || self.pool.is_some()
     }
 
+    /// `system` is the configured system headroom; `None` keeps a twentieth of total memory.
     pub fn headroom_with_inputs(
         &self,
         ranks: usize,
         layout: &Layout,
         max_active: usize,
         inputs: bool,
+        system: Option<u64>,
     ) -> Result<(u64, u64)> {
         if !self.enabled() {
             return Ok((0, 0));
@@ -69,7 +71,7 @@ impl PrefixCacheOffload {
         let disk = self.disk.is_some() && self.disk_limit != Some(0);
         let intake = if memory != 0 || disk {
             intake_slots(layout, max_active)
-                .min((host_pool_budget(memory)? / layout.page_record_bytes) as usize)
+                .min((host_pool_budget(memory, system)? / layout.page_record_bytes) as usize)
                 .max(intake_slots(layout, 1)) as u64
         } else {
             0
@@ -373,10 +375,11 @@ pub fn prepare(
     registrar: &dyn crate::HostRegistrar,
 ) -> Result<Preparation> {
     prepare_with_inputs(
-        options, core, identity, geometry, contexts, 1, 0, None, registrar,
+        options, core, identity, geometry, contexts, 1, 0, None, None, registrar,
     )
 }
 
+/// `system` is the configured system headroom; `None` keeps a twentieth of total memory.
 pub fn prepare_with_inputs(
     options: &PrefixCacheOffload,
     core: &std::path::Path,
@@ -386,6 +389,7 @@ pub fn prepare_with_inputs(
     max_active: usize,
     input_staging: u64,
     shard: Option<(usize, usize)>,
+    system: Option<u64>,
     registrar: &dyn crate::HostRegistrar,
 ) -> Result<Preparation> {
     if !options.enabled() {
@@ -454,6 +458,7 @@ pub fn prepare_with_inputs(
                 &layout,
                 max_active,
                 input_staging != 0,
+                system,
             )?;
             let intake = ((host - memory_bytes) / layout.page_record_bytes) as usize;
             let bytes = (checkpoint_memory / layout.page_record_bytes + intake as u64)
@@ -624,7 +629,12 @@ fn free_space(path: &std::path::Path) -> Result<u64> {
 mod tests;
 
 pub const HOST_SERVICE_HEADROOM_BYTES: u64 = 2 << 30;
-pub const HOST_SYSTEM_SHARE: u64 = 20;
+const HOST_SYSTEM_SHARE: u64 = 20;
+/// Host memory left to the rest of the system: `configured` bytes when the system headroom is
+/// set, otherwise a twentieth of `total`.
+pub fn system_headroom(total: u64, configured: Option<u64>) -> u64 {
+    configured.unwrap_or(total / HOST_SYSTEM_SHARE)
+}
 pub fn available_memory(meminfo: &str, total: usize) -> Result<usize> {
     let available = meminfo.lines().find_map(|line| {
         let mut fields = line.split_whitespace();
@@ -638,8 +648,8 @@ pub fn available_memory(meminfo: &str, total: usize) -> Result<usize> {
         crate::Error::new("Linux MemAvailable is required to size integrated GPU memory")
     })
 }
-/// Keep the same server allowance and system share as integrated GPU planning.
-pub fn host_pool_budget(future: u64) -> Result<u64> {
+/// Keep the same server allowance and system headroom as integrated GPU planning.
+pub fn host_pool_budget(future: u64, system: Option<u64>) -> Result<u64> {
     #[cfg(unix)]
     let (available, total) = {
         let info = std::fs::read_to_string("/proc/meminfo").map_err(|e| e.to_string())?;
@@ -668,7 +678,7 @@ pub fn host_pool_budget(future: u64) -> Result<u64> {
     };
     Ok(available
         .saturating_sub(future)
-        .saturating_sub(HOST_SERVICE_HEADROOM_BYTES + total / HOST_SYSTEM_SHARE))
+        .saturating_sub(HOST_SERVICE_HEADROOM_BYTES.saturating_add(system_headroom(total, system))))
 }
 
 /// Resources retained from pre-sizing registration through the worker's store attachment.

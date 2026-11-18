@@ -39,6 +39,7 @@ fn prepare_with_inputs(
         1,
         inputs,
         shard,
+        None,
         &crate::testing::IdentityRegistrar,
     )
 }
@@ -111,7 +112,7 @@ fn without_a_pool_nothing_for_it_is_budgeted_or_built() {
     let layout = Layout::new(&[crate::testing::geometry(64, &[("kv", 4096)], 4096)]).unwrap();
     assert_eq!(
         PrefixCacheOffload::default()
-            .headroom_with_inputs(1, &layout, 1, false)
+            .headroom_with_inputs(1, &layout, 1, false, None)
             .unwrap(),
         (0, 0)
     );
@@ -123,16 +124,26 @@ fn without_a_pool_nothing_for_it_is_budgeted_or_built() {
         pool: Some(pool("host:7000")),
         ..tiers.clone()
     };
-    let (device, host) = tiers.headroom_with_inputs(1, &layout, 1, false).unwrap();
+    let (device, host) = tiers
+        .headroom_with_inputs(1, &layout, 1, false, None)
+        .unwrap();
     // Static headroom covers the copier; Hello's regions are budgeted at startup.
     assert_eq!(
-        pooled.headroom_with_inputs(1, &layout, 1, false).unwrap(),
+        pooled
+            .headroom_with_inputs(1, &layout, 1, false, None)
+            .unwrap(),
         (device + STORE_DEVICE_MARGIN_BYTES, host)
     );
     // A pool shares what the CPU reads, so its memory is mapped whole by the device
     // instead of split across ranks.
-    let split = tiers.headroom_with_inputs(2, &layout, 1, false).unwrap().0;
-    let whole = pooled.headroom_with_inputs(2, &layout, 1, false).unwrap().0;
+    let split = tiers
+        .headroom_with_inputs(2, &layout, 1, false, None)
+        .unwrap()
+        .0;
+    let whole = pooled
+        .headroom_with_inputs(2, &layout, 1, false, None)
+        .unwrap()
+        .0;
     assert!(whole > split + STORE_DEVICE_MARGIN_BYTES, "{whole} {split}");
     let alone = PrefixCacheOffload {
         pool: Some(pool("host:7000")),
@@ -140,7 +151,9 @@ fn without_a_pool_nothing_for_it_is_budgeted_or_built() {
     };
     assert!(alone.enabled());
     assert_eq!(
-        alone.headroom_with_inputs(1, &layout, 1, false).unwrap(),
+        alone
+            .headroom_with_inputs(1, &layout, 1, false, None)
+            .unwrap(),
         (STORE_DEVICE_MARGIN_BYTES, 0)
     );
 }
@@ -294,13 +307,17 @@ fn memory_headroom_accounts_for_warm_slots_and_intake() {
     };
     let mut options = PrefixCacheOffload::default();
     assert_eq!(
-        options.headroom_with_inputs(2, &layout, 1, false).unwrap(),
+        options
+            .headroom_with_inputs(2, &layout, 1, false, None)
+            .unwrap(),
         (0, 0)
     );
     let intake = intake_slots(&layout, 1) as u64 * layout.page_record_bytes;
     options.memory_bytes = Some(16 << 30);
     assert_eq!(
-        options.headroom_with_inputs(2, &layout, 1, false).unwrap(),
+        options
+            .headroom_with_inputs(2, &layout, 1, false, None)
+            .unwrap(),
         (
             ((16u64 << 30) + intake).div_ceil(2).div_ceil(512) + STORE_DEVICE_MARGIN_BYTES,
             (16 << 30) + intake
@@ -309,19 +326,23 @@ fn memory_headroom_accounts_for_warm_slots_and_intake() {
     options.disk = Some("records".into());
     let host = (16u64 << 30) + intake;
     assert_eq!(
-        options.headroom_with_inputs(2, &layout, 1, false).unwrap(),
+        options
+            .headroom_with_inputs(2, &layout, 1, false, None)
+            .unwrap(),
         (host.div_ceil(512) + STORE_DEVICE_MARGIN_BYTES, host)
     );
     options.memory_bytes = Some(0);
     assert_eq!(
-        options.headroom_with_inputs(2, &layout, 1, false).unwrap(),
+        options
+            .headroom_with_inputs(2, &layout, 1, false, None)
+            .unwrap(),
         (intake.div_ceil(512) + STORE_DEVICE_MARGIN_BYTES, intake)
     );
     options.memory_bytes = Some(16 << 30);
     options.disk_limit = Some(0);
     assert_eq!(
         options
-            .headroom_with_inputs(2, &layout, 1, false)
+            .headroom_with_inputs(2, &layout, 1, false, None)
             .unwrap()
             .1,
         (16 << 30) + intake
@@ -351,7 +372,9 @@ fn ordinary_input_share_preserves_mapping() {
         ..Default::default()
     };
     let ordinary = input_memory_bytes(1 << 30, true);
-    let (device, host) = options.headroom_with_inputs(2, &layout, 1, true).unwrap();
+    let (device, host) = options
+        .headroom_with_inputs(2, &layout, 1, true, None)
+        .unwrap();
     let intake = intake_slots(&layout, 1) as u64 * layout.page_record_bytes;
     assert_eq!(host, (1 << 30) + intake);
     assert_eq!(
@@ -566,6 +589,7 @@ fn intake_sizes_active_rows_and_rounds_warm_memory_down() {
         active,
         0,
         None,
+        None,
         &crate::testing::IdentityRegistrar,
     )
     .unwrap() else {
@@ -585,9 +609,62 @@ fn intake_shrinks_to_two_full_windows_without_refusing() {
         memory_bytes: Some(memory),
         ..Default::default()
     };
-    let (_, host) = options.headroom_with_inputs(1, &layout, 64, false).unwrap();
+    let (_, host) = options
+        .headroom_with_inputs(1, &layout, 64, false, None)
+        .unwrap();
     assert_eq!(
         host - memory,
         intake_slots(&layout, 1) as u64 * layout.page_record_bytes
     );
+}
+
+#[test]
+fn system_headroom_reaches_intake_sizing_and_the_prepared_pool() {
+    let geometry = vec![crate::testing::geometry(64, &[("kv", 4096)], 3 * 4096)];
+    let layout = Layout::new(&geometry).unwrap();
+    let active = 64;
+    let memory = 17 * 4096;
+    let options = PrefixCacheOffload {
+        memory_bytes: Some(memory),
+        pool: Some(pool("unix:/run/selene.sock")),
+        ..Default::default()
+    };
+    let minimum = intake_slots(&layout, 1);
+    assert!(minimum < intake_slots(&layout, active));
+    // A headroom beyond host memory leaves no host budget on any host, so the planned and
+    // the prepared intake are both the minimum.
+    let system = Some(u64::MAX);
+    let (_, host) = options
+        .headroom_with_inputs(1, &layout, active, false, system)
+        .unwrap();
+    assert_eq!(host - memory, minimum as u64 * layout.page_record_bytes);
+    let Preparation::Store(prepared) = super::prepare_with_inputs(
+        &options,
+        std::path::Path::new("unused"),
+        [0; 32],
+        geometry,
+        vec![(0, 0)],
+        active,
+        0,
+        None,
+        system,
+        &crate::testing::IdentityRegistrar,
+    )
+    .unwrap() else {
+        panic!("no store")
+    };
+    assert!(prepared.intake_warning(active).is_some());
+    let pool = prepared.memory_pool.as_ref().unwrap();
+    assert_eq!(pool.intake_slots(), minimum);
+}
+
+#[test]
+fn configured_system_headroom_replaces_the_twentieth_of_host_memory() {
+    let gib = 1u64 << 30;
+    assert_eq!(system_headroom(120 * gib, None), 6 * gib);
+    assert_eq!(system_headroom(120 * gib, Some(6 * gib)), 6 * gib);
+    assert_eq!(system_headroom(120 * gib, Some(gib)), gib);
+    assert_eq!(system_headroom(120 * gib, Some(0)), 0);
+    // A headroom beyond host memory leaves no budget; it does not overflow.
+    assert_eq!(host_pool_budget(0, Some(u64::MAX)).unwrap(), 0);
 }

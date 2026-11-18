@@ -1,5 +1,6 @@
 //! Typed host configuration independent of frontend argument parsing.
 use flare_helios::offload::{parse_drain_on_shutdown, parse_max_age, parse_size};
+use flare_helios::runtime_core::parse_system_headroom;
 use serde::Deserialize;
 use std::{
     collections::HashMap,
@@ -41,6 +42,7 @@ pub struct Model {
 #[serde(default)]
 pub struct Memory {
     pub reserve: Option<String>,
+    pub system_headroom: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -80,6 +82,7 @@ impl Configuration {
             return Err("server.scheduler_checkpoint_extra_work_fraction must be finite and between zero and one".into());
         }
         size(configuration.memory.reserve.as_deref(), "memory.reserve")?;
+        system_headroom(configuration.memory.system_headroom.as_deref())?;
         size(
             nonempty(configuration.prefix_cache.memory.as_deref()),
             "prefix_cache.memory",
@@ -132,6 +135,17 @@ pub fn nonempty(value: Option<&str>) -> Option<&str> {
 pub fn size(value: Option<&str>, key: &str) -> Result<Option<u64>, Failure> {
     value
         .map(|value| parse_size(value).map_err(|error| format!("{key}: {error}").into()))
+        .transpose()
+}
+
+/// The `[memory] system_headroom` size; an empty value leaves the default.
+pub fn system_headroom(value: Option<&str>) -> Result<Option<u64>, Failure> {
+    value
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            parse_system_headroom(value)
+                .map_err(|error| format!("memory.system_headroom: {error}").into())
+        })
         .transpose()
 }
 

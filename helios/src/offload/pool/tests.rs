@@ -125,6 +125,7 @@ fn peer_registration_budget_disables_the_whole_ranked_instance() {
             1,
             0,
             Some((1, 2)),
+            None,
         )
         .unwrap();
         let super::super::Preparation::Store(resources) = &mut prepared else {

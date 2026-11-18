@@ -666,7 +666,11 @@ row and page counts, limited by the rank with the smallest remaining budget.
 On integrated GPUs such as GB10, that budget is Linux `MemAvailable`, capped
 by CUDA's device total. CPU allocations, registered buffers, and GPU allocations
 share physical DRAM; reclaimable page cache contributes to available memory,
-while swap does not. Discrete GPUs use CUDA's free device-memory query.
+while swap does not. An integrated GPU's budget also leaves 2 GiB for the
+server's later host allocations and a system headroom for the operating system
+and other processes: a twentieth of total memory, or the size set by
+`--system-headroom` or `[memory] system_headroom`. Discrete GPUs use CUDA's
+free device-memory query and keep neither.
 Dedicated rows comprise one null row and the selected request capacity times
 the recipe's execution rows per request. KV pages receive the remaining budget,
 within their virtual maximum. The planner accounts for mapping alignment and

@@ -51,7 +51,7 @@ mod serving;
 #[cfg(test)]
 mod shared_memory_tests;
 pub use archive::{CoreFile, core_companions};
-pub use limits::{KvCacheLimit, MemoryLimit};
+pub use limits::{KvCacheLimit, MemoryLimit, parse_system_headroom};
 pub use model::{
     CacheAgreement, ClusterRank, NativeModel, RankNeeds, RoceSpec, core_cluster, rank_needs,
     rank_ranges, reserve_bytes,
