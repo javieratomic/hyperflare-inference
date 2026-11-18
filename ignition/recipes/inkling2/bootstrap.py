@@ -26,7 +26,7 @@ from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime, create_all_gather_runtime
 from ignition.preparation.execution import GraphSignature
 from ignition.preparation.fixtures.recurrent import register_benchmark_state
-from ignition.preparation.host_memory import release_unused
+from ignition.preparation.host_memory import COMPILE_HEADROOM_BYTES, release_unused
 from ignition.preparation.model import PreparedModel
 from ignition.preparation.rebuild_manifest import declare_weights
 from ignition.preparation.rank_group import minimum_across_ranks
@@ -49,6 +49,7 @@ class PreparationConfig:
     prompt_logprobs: bool = False
     image_concurrency: int | None = None
     compile_workers: int | None = None
+    compile_headroom_bytes: int = COMPILE_HEADROOM_BYTES
     native_dense_activations: bool = False
     lock_gpu_clocks: bool = False
     autotune_effort: str = "off"
@@ -93,7 +94,7 @@ class PreparationConfig:
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
         if self.drafting and (not self.speculative_widths or not set(self.speculative_widths) <= set(range(1, 9))):
             raise ValueError("Inkling 2 verification widths must be in [1, 8]")
-        if self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0:
+        if self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0 or self.compile_headroom_bytes < 0:
             raise ValueError("snapshot budget must be positive and headroom nonnegative")
         object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency) if self.vision else 0)
         _ = self.speculative_round_shapes
@@ -215,6 +216,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
             "decoder_layers": len(weights.layers), "contract": "inkling2.paged-text.v1"},
             sort_keys=True, default=str).encode()).hexdigest()
         session = RecordedPreparationSession(compile_workers=config.compile_workers,
+            compile_headroom_bytes=config.compile_headroom_bytes,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
             tuning_replica=config.tuning_replica,
             device=device, checkpoint=identity, workload_schema="inkling2", numerical_policy="default",

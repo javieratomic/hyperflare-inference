@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from ignition import planning
-from ignition.recipes import resolve
+from ignition.recipes import ResolvedModel, recipes, resolve
 from ignition.recipes.declaration import Speculation
 
 HUB = Path.home() / ".cache/huggingface/hub"
@@ -459,3 +459,30 @@ def test_parallel_recipe_defaults_capture_ragged_rows_at_declared_width(alias, o
     assert all(batch <= packed <= min(128, batch * width) for batch, width, packed in shapes)
     assert config.decode_tokens == 128
     assert config.decode_samples == 32 * (selected.draft_tokens + 1)
+
+
+@pytest.mark.parametrize("recipe", recipes(), ids=lambda recipe: recipe.name)
+def test_adapters_carry_compile_headroom_into_the_preparation_config(monkeypatch, tmp_path, recipe):
+    from dataclasses import replace
+
+    from ignition.preparation.host_memory import COMPILE_HEADROOM_BYTES
+
+    seen = []
+    def record(snapshot, config, *args, **options):
+        seen.append(config)
+        return "prepared"
+    model = ResolvedModel(recipe, recipe.checkpoints[0])
+    gpus = min((size for size in recipe.tensor_parallel if size > 1), default=1)
+    monkeypatch.setattr("ignition.preparation.rank_group.prepare_group", record)
+    if gpus == 1:
+        bootstrap_name = "kimi3" if recipe.name == "kimi31" else recipe.name
+        monkeypatch.setattr(f"ignition.recipes.{bootstrap_name}.bootstrap.prepare", record)
+    plan = fitted(model, gpus, speculation=None)
+    assert plan.compile_headroom_bytes == COMPILE_HEADROOM_BYTES
+    for headroom in (COMPILE_HEADROOM_BYTES, 6 << 30, 0):
+        prepared = model.recipe.prepare(tmp_path, replace(plan, compile_headroom_bytes=headroom),
+                                        compile_forwards=True, kernel_cache=None, progress=None)
+        assert prepared == "prepared" and seen.pop().compile_headroom_bytes == headroom
+    with pytest.raises(ValueError, match="headroom"):
+        model.recipe.prepare(tmp_path, replace(plan, compile_headroom_bytes=-1),
+                             compile_forwards=True, kernel_cache=None, progress=None)
