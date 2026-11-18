@@ -21,7 +21,13 @@ Graph input uploads use rank-control packets of at most 64 MiB. Larger input
 sets are split on tensor-element boundaries, with the total bytes bounded by
 the prepared input-frame extent. Each peer validates the complete upload set
 before acknowledging readiness; graph replay begins only after every rank is
-ready. Small input sets use one packet. Serving builds must agree on the rank
+ready. Small input sets use one packet. Each peer's greeting tells rank zero
+whether the peer's host reads embedding rows ahead. When any rank's does, rank
+zero also sends each peer, after every rank has committed a prefill step, the
+prompt tokens that the following prefill steps are expected to consume. A peer
+that reads ahead derives its rows from them, and any other peer ignores them;
+these packets carry no graph input and need no acknowledgment. Serving
+builds must agree on the rank
 control protocol version; changing packet framing does not require core
 re-export.
 

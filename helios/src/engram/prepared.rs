@@ -123,6 +123,8 @@ impl PreparedTables {
                 hashes: source.hashes.clone(),
                 event: source.event.clone(),
                 request: source.request.clone(),
+                // Resident tables deliver rows from RAM; nothing is read ahead.
+                hash: None,
             });
         }
         Ok(Arc::new(Index { tables }))

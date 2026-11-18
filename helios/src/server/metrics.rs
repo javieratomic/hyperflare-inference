@@ -216,6 +216,11 @@ pub(super) struct Metrics {
     page_tokens: u64,
     decode_weight_bytes: u64,
     pub engram: Option<std::sync::Arc<crate::engram::Stats>>,
+    /// Prefill steps by where the request they served stood in the order announced for
+    /// embedding row read-ahead: indexes 0, 1 and 2, any later index, and unlisted.
+    engram_guesses: [AtomicU64; 5],
+    /// Prefill steps that withheld their read-ahead announcement.
+    engram_withheld: AtomicU64,
     prefill_tokens: AtomicU64,
     generated_tokens: AtomicU64,
     accepted_drafts: AtomicU64,
@@ -436,6 +441,27 @@ impl Metrics {
                 }
             }
         }
+    }
+
+    /// Record one prefill step: where the request it served stood in the order recorded
+    /// for read-ahead after the preceding prefill step, if there was one, and whether
+    /// the step announced its own order.
+    pub(super) fn prefill_guess(
+        &self,
+        position: Option<super::runtime::GuessPosition>,
+        announced: bool,
+    ) {
+        use super::runtime::GuessPosition;
+        let index = match position {
+            Some(GuessPosition::Listed(index)) => Some(index.min(GuessPosition::LATER)),
+            Some(GuessPosition::Unlisted) => Some(GuessPosition::LATER + 1),
+            None => None,
+        };
+        if let Some(index) = index {
+            self.engram_guesses[index].fetch_add(1, Ordering::Relaxed);
+        }
+        self.engram_withheld
+            .fetch_add(u64::from(!announced), Ordering::Relaxed);
     }
 
     pub fn constrained_submission(&self, outstanding: usize, mixed_decode: bool) {
@@ -767,6 +793,22 @@ impl Metrics {
 
         if let Some(stats) = &self.engram {
             stats.render(&mut text);
+            text.push_str("# HELP flare_engram_prefetch_guesses_total Prefill steps by the position that the request they served had in the order recorded for read-ahead after the preceding prefill step; unlisted when that order did not name the request.\n# TYPE flare_engram_prefetch_guesses_total counter\n");
+            for (position, count) in ["0", "1", "2", "3+", "unlisted"]
+                .into_iter()
+                .zip(&self.engram_guesses)
+            {
+                let _ = writeln!(
+                    &mut text,
+                    "flare_engram_prefetch_guesses_total{{position=\"{position}\"}} {}",
+                    count.load(Ordering::Relaxed)
+                );
+            }
+            let _ = writeln!(
+                &mut text,
+                "# HELP flare_engram_prefetch_withheld_total Prefill steps that announced nothing to read ahead for several prefilling requests, because the order was wrong in more than two of the last eight steps it was scored on.\n# TYPE flare_engram_prefetch_withheld_total counter\nflare_engram_prefetch_withheld_total {}",
+                self.engram_withheld.load(Ordering::Relaxed)
+            );
         }
         text.push_str("# HELP flare_sampling_graph_launches_total Successful native submissions by captured sampler mode; includes consumption-only prefill.\n# TYPE flare_sampling_graph_launches_total counter\n");
         for (kind, count) in ["prefill", "decode", "resume", "speculative", "mixed"]
@@ -1352,6 +1394,36 @@ mod tests {
         assert!(text.contains("flare_replay_gpu_nanoseconds_total 20000\n"));
         assert!(text.contains("flare_replay_readiness_wait_nanoseconds_total 2000\n"));
         assert!(text.contains("flare_replay_readiness_samples_total 1\n"));
+    }
+
+    #[test]
+    fn read_ahead_guesses_report_by_position_beside_the_engram_counters() {
+        use super::super::runtime::GuessPosition::{Listed, Unlisted};
+
+        let mut metrics = Metrics::new(0, 0, 0, 16);
+        // Without embedding tables the guesses are not exported.
+        metrics.prefill_guess(Some(Listed(0)), true);
+        assert!(!metrics.render().contains("flare_engram_prefetch_guesses_total"));
+        metrics.engram = Some(Default::default());
+        // The first prefill step scores nothing; every index from the fourth on reports
+        // as `3+`.
+        metrics.prefill_guess(None, true);
+        metrics.prefill_guess(Some(Listed(0)), true);
+        metrics.prefill_guess(Some(Listed(2)), true);
+        metrics.prefill_guess(Some(Listed(3)), false);
+        metrics.prefill_guess(Some(Listed(9)), false);
+        metrics.prefill_guess(Some(Unlisted), false);
+        let text = metrics.render();
+        for line in [
+            "flare_engram_prefetch_guesses_total{position=\"0\"} 2\n",
+            "flare_engram_prefetch_guesses_total{position=\"1\"} 0\n",
+            "flare_engram_prefetch_guesses_total{position=\"2\"} 1\n",
+            "flare_engram_prefetch_guesses_total{position=\"3+\"} 2\n",
+            "flare_engram_prefetch_guesses_total{position=\"unlisted\"} 1\n",
+            "flare_engram_prefetch_withheld_total 3\n",
+        ] {
+            assert!(text.contains(line), "{line}");
+        }
     }
 
     #[test]

@@ -606,7 +606,149 @@ the cache does not alter that staging's consumer fences. Approximate usage count
 requested rows; recency breaks ties, and periodic count decay adapts to workload
 changes. Each server start creates an empty row cache; request gathers populate
 it without persistent cache files. `/metrics` exposes `flare_engram_` gather
-time, disk traffic, cache hits, misses, evictions, occupancy, capacity and bytes.
+time, disk traffic, cache hits, misses, evictions, occupancy, capacity and bytes,
+and the read-ahead gauges and counters described below.
+
+### Row read-ahead
+
+A graph publishes the rows it needs only when it starts, so a gather's disk
+reads otherwise run while the graph waits for them. Tables whose row IDs are an
+XOR-modulo hash of prompt tokens, as DeepSeek Engram tables are, can read the
+rows of following prefill steps ahead instead; the
+[execution manifest](manifest.md#native-runtime-core) specifies the hash.
+Read-ahead is implemented for the Linux readers of disk tables with a row
+cache. Its effect on serving is not qualified; [docs/TODO.txt](../docs/TODO.txt)
+records the pending measurement.
+
+**Announcement.** After submitting a step with prefill lanes, the serving worker
+announces prompt tokens to every rank, as windows in the order their rows are
+wanted. A prompt is fixed at admission and consumed in order, but the scheduler
+chooses each step's request and width once the preceding step completes, so
+the windows follow positions: for a prompt, one step of the widest graph past
+the position it will have reached. The first window of each prompt holds as
+many tokens as the submitted step took, and a second window the rest. One
+announcement lists at most four steps of tokens. A step without prefill lanes
+announces nothing. The worker announces when the tables of any rank read
+ahead. Ranks in one process share its table storage and row cache; a rank in
+another process has its own host's, and tells rank zero when it joins whether
+its tables read ahead. A rank whose tables do not ignores the announcement.
+An announcement leaves rank zero once every rank has committed the step it
+follows. An executor that cannot send it to a rank is poisoned: its next poll
+or submission returns the error.
+
+**Order.** Prompts are listed in the order the scheduler is expected to prefill
+them. `RequestScheduler::prefill_order` rates each request that still has
+prompt tokens by its best prefill graph, as selection does, with the submitted
+step charged to every request's service price at the step's estimated
+duration, and lists the highest rate first. A price rises while steps serve
+other requests and falls with service, so when steps last much longer than the
+policy's adaptation time the request that has waited longest is listed first
+and the request just served last. Two steps are not charged in advance as
+their completion charges them: a step whose graph has no measured duration yet
+is charged to no price, and a mixed step is charged without the tokens its
+prompt consumes. The requests of such a step are listed last, which is where
+their completion puts them when the step lasts longer than the adaptation
+time; after a shorter step a request can keep the highest price and be served
+again. The order is a prediction:
+selection runs when the step completes, on its measured duration and with the
+requests that started to prefill meanwhile, and a request of the submitted
+step is rated at the position it had before the step. Requests are rated by
+prefill graphs alone; a mixed graph takes the prompt worth most at its own
+prefill capacity, which can differ when prompts have unequal steps left.
+
+The read-ahead holds about one step of rows. A prefill step that serves another
+request than the one listed first therefore finds none of its rows held, and
+the rows read for the listed request are dropped once an announcement lists
+another request first: a wrong order adds disk reads and saves none. The worker
+scores each order against the prefill step that follows it, among the requests
+of the order that still exist. While more than two of the last eight orders
+made among several requests listed first another request than the one served,
+the worker announces nothing for several requests; it keeps scoring, and
+announces again once at most two of the last eight were wrong. A step that
+serves a request that was not prefilling when the order was made, because it
+was admitted, initialized or restored later or was capturing a checkpoint at a
+message boundary, counts neither way: that order did not list it. The rows
+held for a request that an order omits are dropped. A single prefilling request is always announced, and the
+record of wrong orders is cleared whenever fewer than two requests are left
+prefilling.
+
+**Reading.** Each rank's table reader derives the rows of its own partition
+from the windows. It applies an announcement once it has delivered the rows of
+the submitted step and no gather is in flight for any table of its rank group,
+so that reading ahead for one table does not compete for the disk with a gather
+that the GPU waits for. A row already held stays held while announcements list
+it and is dropped when one no longer does. The rows that neither the read-ahead
+nor the row cache holds are read in window order and in ascending row ID within
+a window, in segments of rows of one window whose reads normally fit one I/O
+batch. The rows of a segment that has been read take free slots. Rows of the
+first window, the next step of the prompt expected next, then take the slots
+of held rows that only later windows list: a held row gives up its slot when
+the row replacing it has been read. Rows of every other window take free slots
+only, and rows that would find no slot are not read. A prompt's rows therefore
+wait for its step while other prompts are served, whatever the width of the
+steps, and are dropped for another prompt only when that prompt is expected
+next and its step's rows are not held. Once every held row is listed and no
+further row could take a slot, the rest of the announcement is not derived. A gather submitted
+meanwhile ends the pass before its next segment: the gather waits for the
+segment being read, whose rows stay held, and the next announcement reads what
+is still missing.
+
+**Use.** A gather takes rows read ahead from memory, offers them to the row
+cache as it does rows it reads itself, and frees their slots: read-ahead holds
+only rows that no gather has taken. The graph still publishes its requests and
+the gather delivers exactly those rows, so an announcement never changes a
+graph input. A wrong prediction costs the disk reads of rows that are dropped
+unused. A read-ahead read that fails after its I/O completed is dropped and
+counted; the gather that needs those rows reads them again and reports its own
+failure, so rows that no graph requests cannot fail a step. A failure that
+leaves reads outstanding makes the table's reader unusable: the next
+submission reports it, and so does a gather already queued for that reader. A
+step whose rows were already delivered is not failed. A panic while deriving
+rows or keeping the list of held rows, with every read completed, ends
+read-ahead for that table: the rows held are dropped, the table keeps serving
+gathers from the row cache and the disk, a line on standard error gives the
+cause, and `flare_engram_prefetch_capacity_rows` no longer counts its rows.
+
+**Memory.** The rows read ahead occupy part of the row-cache budget: per table,
+room for the rows that one step of the widest graph requests from the rank's
+partition, within a quarter of the bytes the table's budget leaves for cached
+rows. A smaller budget holds fewer rows, or none. Tables with EOS-bounded
+hashes, RAM table storage, a disabled row cache and the Windows readers do not
+read ahead. For disk tables whose rows the host can derive, the loader's
+embedding-table summary states the rows held, and why when they are fewer than
+one step or none; for the other tables it says nothing about read-ahead.
+Outside that budget, each delivery group whose core has such a table keeps the
+core's token map for the derivation, four bytes per vocabulary entry, whether
+or not its tables read ahead: one map for ranks that share their readers, and
+one per rank for ranks with their own partitions.
+
+**Metrics.** The `flare_engram_prefetch_` metrics count row read-ahead.
+`flare_engram_prefetch_step_rows` is the rows one step requests from the tables
+that could read ahead, and `flare_engram_prefetch_capacity_rows` the rows their
+read-ahead holds. `flare_engram_prefetch_rows_total` counts rows read ahead,
+`flare_engram_prefetch_hits_total` the cache misses served from them,
+`flare_engram_prefetch_unused_total` the rows dropped before any gather took
+them, `flare_engram_prefetch_interrupted_total` the passes that a gather or a
+cancelled delivery cut short, `flare_engram_prefetch_errors_total` the passes
+that a failed read or a panic ended, and
+`flare_engram_prefetch_nanoseconds_total` the time spent reading ahead. Cache misses beyond those served from read-ahead were
+read inside their gather: their tokens were not announced, their rows did not
+fit, or their read had not finished. Like every `flare_engram_` metric, these
+cover rank zero's delivery group. The ranks of other processes keep their own
+statistics, which `/metrics` does not export; the loader's embedding-table
+summary adds up the groups of its own process.
+
+`flare_engram_prefetch_guesses_total` counts prefill steps by the `position`
+that the request they served had in the order made after the preceding prefill
+step: `0` for the request listed first, `1`, `2`, `3+`, and `unlisted` for a
+request that was not prefilling when the order was made.
+`flare_engram_prefetch_withheld_total` counts the prefill steps after which
+the worker announced nothing because the order had been failing. Both describe
+the serving worker's order, whichever ranks read ahead. Rows are derived by a
+native equation and not by the captured graph; a derivation that differed from
+the graph's would show as unused rows approaching the rows read ahead, with
+hardly any miss served from them, while the guesses stay at position `0`. A
+wrong order shows as guesses at other positions.
 
 ## Prefix checkpoint policy
 

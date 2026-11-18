@@ -243,7 +243,8 @@ message Graph {
 // logical payload `Span` with a `PayloadUse` slice. Table partitions are per deployment because
 // they are owned by individual TP ranks.
 message Engram {
-  // Raw token ID to normalized vocabulary ID; normalization runs only during preparation.
+  // Raw token ID to normalized vocabulary ID. Captured graphs normalize tokens themselves;
+  // Helios applies this map only to derive the rows that row read-ahead reads.
   repeated uint32 token_map = 1;
   uint32 pad_token_id = 2;
   uint32 compressed_vocabulary = 3;

@@ -771,6 +771,290 @@ fn gpu_time(ns: u64) -> ExecutionTiming {
     }
 }
 
+/// Durations that make the widest prefill graph of [`engine`] last about nine times the
+/// policy's adaptation time, so that a step lowers the served request's token price
+/// below every waiting request's, as steps of production prompts do.
+fn slow_prefill_ns(kind: GraphKind, capacity: usize) -> u64 {
+    match kind {
+        GraphKind::Prefill => (capacity as u64 / 64 + 1) * 100 * MS,
+        _ => MS / 10,
+    }
+}
+
+/// [`engine`] for four requests whose graphs take [`slow_prefill_ns`]; `measured` tells
+/// whether the scheduler knows those durations before it runs the graphs.
+fn slow_prefill_engine(measured: bool) -> RequestScheduler {
+    let mut s = engine(4, false);
+    let mut graphs = super::tests::duration_graphs(4);
+    for graph in &mut graphs {
+        graph.estimated_duration_ns = slow_prefill_ns(graph.kind, graph.token_capacity);
+    }
+    if measured {
+        s.measured_graph_durations(&graphs).unwrap();
+    } else {
+        s.graph_durations(&graphs).unwrap();
+    }
+    s
+}
+
+/// What the steps with a prefill lane served in one run, against the order that embedding
+/// row read-ahead announces after the preceding such step.
+#[derive(Debug, Default)]
+struct OrderScore {
+    /// Steps with a prefill lane, those among them that were mixed steps, and those
+    /// that consumed fewer than 512 tokens.
+    steps: usize,
+    mixed: usize,
+    narrow: usize,
+    /// Steps that served the request listed first, another listed request, and a
+    /// request that was not prefilling when the order was made.
+    first: usize,
+    other: usize,
+    unlisted: usize,
+    /// Prompts consumed to their end.
+    prompts: usize,
+}
+
+/// Run `s` until it has nothing to plan and score its prefill order. Each entry of
+/// `arrivals` admits a request once that many steps with a prefill lane were submitted,
+/// with its prompt and output tokens; every prompt has a message boundary at each
+/// position of `boundaries` inside it. With `cancel`, the request listed first is
+/// cancelled once after that many such steps. `duration` gives the measured duration of
+/// a step.
+fn score_prefill_order(
+    s: &mut RequestScheduler,
+    arrivals: &[(usize, usize, u32)],
+    boundaries: &[usize],
+    mut cancel: Option<usize>,
+    duration: &dyn Fn(&ScheduledPlan) -> u64,
+) -> OrderScore {
+    let mut score = OrderScore::default();
+    let mut admitted = 0;
+    // The requests of the order made after the last step with a prefill lane.
+    let mut expected: Option<Vec<RequestHandle>> = None;
+    for _ in 0..4000 {
+        while admitted < arrivals.len() && arrivals[admitted].0 <= score.steps {
+            let (_, prompt, output) = arrivals[admitted];
+            s.admit(RequestSpec {
+                prompt: vec![admitted as u32 + 1; prompt],
+                message_boundaries: boundaries.iter().copied().filter(|at| *at < prompt).collect(),
+                conditioning: vec![],
+                max_new_tokens: output,
+                grammar_constrained: false,
+                host_stops: false,
+                prompt_logprobs: false,
+                growable_output: false,
+            })
+            .unwrap();
+            admitted += 1;
+        }
+        if cancel.is_some_and(|after| after <= score.steps) {
+            if let Some(&listed) = expected.as_ref().and_then(|order| order.first()) {
+                s.cancel(listed).unwrap();
+                cancel = None;
+            }
+        }
+        let Some(plan) = s.plan() else {
+            break;
+        };
+        let fence = Fence(s.submitted.0 + 1);
+        s.commit(&plan, fence).unwrap();
+        let lane = plan
+            .lanes
+            .iter()
+            .enumerate()
+            .find(|(row, _)| plan.lane_kind(*row).is_prefill())
+            .map(|(_, lane)| lane.clone());
+        if let Some(lane) = lane {
+            score.steps += 1;
+            score.mixed += usize::from(plan.kind == GraphKind::Mixed);
+            score.narrow += usize::from(lane.tokens < 512);
+            if let Some(expected) = &mut expected {
+                // A cancelled request is no longer expected.
+                expected.retain(|&request| s.request(request).is_ok());
+                match expected.iter().position(|&request| request == lane.request) {
+                    Some(0) => score.first += 1,
+                    Some(_) => score.other += 1,
+                    None => score.unlisted += 1,
+                }
+            }
+            let order = s.prefill_order(fence);
+            // Each request is listed at the position it will have reached, and only
+            // while it has prompt tokens left.
+            let prompt = s.request(lane.request).unwrap().prompt_tokens;
+            let end = lane.start_position as usize + lane.tokens;
+            score.prompts += usize::from(end == prompt);
+            assert_eq!(
+                order.iter().any(|&(request, _)| request == lane.request),
+                end < prompt
+            );
+            for &(request, position) in &order {
+                let live = s.request(request).unwrap();
+                let consumed = live.consumed_tokens as usize;
+                assert_eq!(position, if request == lane.request { end } else { consumed });
+                assert!(position < live.prompt_tokens);
+            }
+            expected = Some(order.into_iter().map(|(request, _)| request).collect());
+        }
+        let ns = duration(&plan);
+        s.advance_to(s.now_ns + ns).unwrap();
+        complete_timed(s, &plan, fence, 0, true, gpu_time(ns));
+    }
+    assert_eq!(admitted, arrivals.len());
+    // An unknown submission has no order.
+    assert!(s.prefill_order(Fence(s.submitted.0 + 1)).is_empty());
+    score
+}
+
+/// 2048-token prompts admitted once the count of prefill steps reaches each entry.
+fn late(steps: &[usize]) -> Vec<(usize, usize, u32)> {
+    steps.iter().map(|&after| (after, 2048, 2)).collect()
+}
+
+/// Every prefill step but the first is scored and serves the request listed first,
+/// unless it serves a request that was not prefilling when the order was made. A request
+/// joins the order with its first prefill step at the latest, so that happens at most
+/// once for each request but the first.
+fn assert_order_held(score: &OrderScore, requests: usize) {
+    assert_eq!(score.prompts, requests, "{score:?}");
+    assert_eq!(score.other, 0, "{score:?}");
+    assert_eq!(score.first + score.unlisted, score.steps - 1, "{score:?}");
+    assert!(score.unlisted < requests, "{score:?}");
+}
+
+#[test]
+fn prefill_order_names_the_next_request_among_three_and_four_with_late_arrivals() {
+    for arrivals in [
+        // Two requests alternate before the third arrives.
+        late(&[0, 0, 3]),
+        // The first request is served twice before the others arrive one after another.
+        late(&[0, 2, 3]),
+        // Four requests from the start, in slot order.
+        late(&[0, 0, 0, 0]),
+        // Two requests alternate; the third and the fourth arrive while they are served.
+        late(&[0, 0, 2, 5]),
+        // One request is served twice, then three arrive at once.
+        late(&[0, 2, 2, 2]),
+    ] {
+        for throughput in [false, true] {
+            let mut s = slow_prefill_engine(true);
+            if throughput {
+                s.configure_policy(PolicyConfig::throughput()).unwrap();
+            }
+            let score = score_prefill_order(&mut s, &arrivals, &[], None, &|plan| {
+                plan.estimated_duration_ns()
+            });
+            assert!(score.steps >= 4 * arrivals.len(), "{score:?}");
+            assert_order_held(&score, arrivals.len());
+        }
+    }
+}
+
+// A graph without a measured duration is charged to no service price until it completes.
+// The order lists the requests of such a step last, so that it holds while a server that
+// has measured nothing yet runs each prefill graph for the first time.
+#[test]
+fn prefill_order_holds_while_graph_durations_are_unmeasured() {
+    for arrivals in [late(&[0, 0]), late(&[0, 0, 0, 0]), late(&[0, 0, 2, 5])] {
+        let mut s = slow_prefill_engine(false);
+        let score = score_prefill_order(&mut s, &arrivals, &[], None, &|plan| {
+            slow_prefill_ns(plan.kind, plan.token_capacity)
+        });
+        assert_order_held(&score, arrivals.len());
+    }
+}
+
+#[test]
+fn prefill_order_holds_for_prompts_of_unequal_length() {
+    // Prompts that end inside a step, one of them shorter than a step of the widest graph.
+    let arrivals = [(0, 1900, 2), (0, 700, 2), (2, 2048, 2), (4, 300, 2)];
+    for throughput in [false, true] {
+        let mut s = slow_prefill_engine(true);
+        if throughput {
+            s.configure_policy(PolicyConfig::throughput()).unwrap();
+        }
+        let score =
+            score_prefill_order(&mut s, &arrivals, &[], None, &|plan| plan.estimated_duration_ns());
+        assert!(score.narrow > 0, "{score:?}");
+        assert_order_held(&score, arrivals.len());
+    }
+}
+
+// A message boundary can end a step early, where the scheduler captures a checkpoint.
+// A request that is capturing one when another request's step is submitted is not
+// prefilling, so that step's order omits it: its next step can be served unlisted once
+// for each boundary, beside the once of its first step. Among the requests an order
+// lists, the first is still the one served.
+#[test]
+fn prefill_order_holds_for_prompts_with_message_boundaries() {
+    let arrivals = late(&[0, 0, 2, 5]);
+    let boundaries = [300, 700, 1500];
+    let mut s = slow_prefill_engine(true);
+    let score = score_prefill_order(&mut s, &arrivals, &boundaries, None, &|plan| {
+        plan.estimated_duration_ns()
+    });
+    assert!(score.narrow > 0, "{score:?}");
+    assert_eq!((score.prompts, score.other), (arrivals.len(), 0), "{score:?}");
+    assert_eq!(score.first + score.unlisted, score.steps - 1, "{score:?}");
+    assert!(score.unlisted < arrivals.len() * (1 + boundaries.len()), "{score:?}");
+    assert!(score.first > score.unlisted, "{score:?}");
+}
+
+// Measured graph durations expire after the policy's estimate lifetime, and the scheduler
+// then runs a graph it would not choose, to measure it again. Twelve steps for each of
+// four prompts outlast that lifetime, and none of the prompts ends inside a step: a
+// step narrower than the widest graph is such a measurement.
+#[test]
+fn prefill_order_holds_across_steps_that_measure_expired_graph_durations() {
+    let arrivals: Vec<(usize, usize, u32)> = (0..4).map(|_| (0, 6144, 2)).collect();
+    let mut s = slow_prefill_engine(true);
+    let score =
+        score_prefill_order(&mut s, &arrivals, &[], None, &|plan| plan.estimated_duration_ns());
+    assert!(score.narrow > 0, "{score:?}");
+    assert_order_held(&score, arrivals.len());
+}
+
+#[test]
+fn a_cancelled_request_leaves_the_prefill_order_to_the_next_one_listed() {
+    let arrivals = late(&[0, 0, 0, 0]);
+    let mut s = slow_prefill_engine(true);
+    let score =
+        score_prefill_order(&mut s, &arrivals, &[], Some(6), &|plan| plan.estimated_duration_ns());
+    // The request listed first after the sixth prefill step is cancelled; the seventh
+    // serves the next one listed.
+    assert_eq!((score.prompts, score.other), (3, 0), "{score:?}");
+    assert_eq!(score.first + score.unlisted, score.steps - 1, "{score:?}");
+    assert!(score.unlisted < 4, "{score:?}");
+}
+
+// A mixed step prefills the prompt whose lane is worth most at its prefill capacity,
+// beside decode lanes. For prompts with equal steps left that is the prompt a prefill
+// graph is worth most for, which the order names. The prompt of a mixed step is listed
+// last, because the step is charged in advance without the tokens that prompt consumes.
+#[test]
+fn prefill_order_names_the_prompt_that_mixed_steps_prefill() {
+    let mut shapes = Vec::new();
+    for batch in [2, 4] {
+        for prefill in [512, 4096] {
+            let decode = (15 + 2 * (batch as u64 - 2)) * MS;
+            shapes.push((batch, 1, prefill, (2 * MS + prefill as u64 * MS / 64 + decode) * 4 / 5));
+        }
+    }
+    // One request decodes while three prompts of four full steps each are prefilled.
+    // They arrive once its own short prompt is consumed.
+    let arrivals = [(0, 64, 256), (1, 16384, 2), (1, 16384, 2), (1, 16384, 2)];
+    for throughput in [false, true] {
+        let mut s = mixed_engine(4, false, &shapes);
+        if throughput {
+            s.configure_policy(PolicyConfig::throughput()).unwrap();
+        }
+        let score =
+            score_prefill_order(&mut s, &arrivals, &[], None, &|plan| plan.estimated_duration_ns());
+        assert!(score.mixed > 0, "{score:?}");
+        assert_order_held(&score, arrivals.len());
+    }
+}
+
 fn price_close(actual: utility::ServicePrice, expected: utility::ServicePrice) {
     assert!((actual.log_price(1.0) - expected.log_price(1.0)).abs() < 1e-12);
 }

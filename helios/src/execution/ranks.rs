@@ -57,6 +57,32 @@ impl RankExecutor {
         }
     }
 
+    /// The extent of the announcements that some rank can use, or `None` when no rank
+    /// reads rows ahead; see [`GraphExecutor::read_ahead_extent`]. Ranks in one process
+    /// share its table storage and row cache. Ranks in other processes have their own,
+    /// and report when they join whether their tables read ahead.
+    #[cfg(feature = "server")]
+    pub(crate) fn read_ahead_extent(&self) -> Option<super::ReadAheadExtent> {
+        match self {
+            Self::Local(executor) => executor
+                .read_ahead_extent()
+                .filter(|_| executor.reads_ahead()),
+            Self::Parallel(executor) => executor.read_ahead_extent(),
+            Self::Threaded(executor) => executor.read_ahead_extent(),
+        }
+    }
+
+    /// Announce on every rank the prompt tokens expected to follow `after`; see
+    /// [`GraphExecutor::announce`].
+    #[cfg(feature = "server")]
+    pub(crate) fn announce(&mut self, after: Fence, windows: &[super::PromptWindow<'_>]) {
+        match self {
+            Self::Local(executor) => executor.announce(after, windows),
+            Self::Parallel(executor) => executor.announce(after, windows),
+            Self::Threaded(executor) => executor.announce(after, windows),
+        }
+    }
+
     pub(crate) fn poll(&mut self) -> Result<Option<FrameCompletion>> {
         match self {
             Self::Local(executor) => executor.poll(),

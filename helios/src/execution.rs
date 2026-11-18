@@ -25,8 +25,8 @@ mod worker;
 pub use parallel::{TensorParallelExecutor, serve_rank};
 pub(crate) use ranks::RankExecutor;
 pub use transport::{
-    CompletionRecord, ExecutionTiming, FrameCompletion, GraphExecutor, PromptLogprobs, TokenLogprobs,
-    TokenVector, Upload,
+    CompletionRecord, ExecutionTiming, FrameCompletion, GraphExecutor, PromptLogprobs,
+    PromptWindow, ReadAheadExtent, TokenLogprobs, TokenVector, Upload,
 };
 pub use worker::{ExecutionWorker, OwnedUpload};
 

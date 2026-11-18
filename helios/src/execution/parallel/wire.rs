@@ -8,7 +8,9 @@ use std::io::{ErrorKind, Read, Write};
 use std::time::Duration;
 
 use crate::cache::Fence;
-use crate::execution::{ExecutionManifest, FrameCompletion, OwnedUpload, RankStream, Upload};
+use crate::execution::{
+    ExecutionManifest, FrameCompletion, OwnedUpload, PromptWindow, RankStream, Upload,
+};
 use crate::{Error, ExecutionError, Failure, Result};
 
 pub(super) const HELLO: u8 = 1;
@@ -24,6 +26,7 @@ pub(super) const PREPARE_MORE: u8 = 10;
 pub(super) const TUNE: u8 = 11;
 pub(super) const TUNED: u8 = 12;
 pub(super) const STARTED: u8 = 13;
+pub(super) const ANNOUNCE: u8 = 14;
 const MAX_PACKET: usize = 64 * 1024 * 1024;
 pub(super) const TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -183,7 +186,7 @@ pub(super) fn validate_completion_packet(manifest: &ExecutionManifest) -> Result
 pub(super) fn layout(manifest: &ExecutionManifest) -> Vec<u8> {
     let mut bytes = Vec::new();
     for value in [
-        6,
+        7,
         manifest.completion_token_capacity,
         manifest.max_active,
         manifest.input_frame_bytes,
@@ -369,6 +372,53 @@ pub(super) fn uploads(
         });
     }
     Ok(uploads)
+}
+
+/// Encode prompt windows expected to follow `after`: the fence, the window count, then per
+/// window its history and token counts followed by those tokens as little-endian `u32`.
+/// Returns `None` when the encoding exceeds one control packet.
+pub(super) fn announcement(after: Fence, windows: &[PromptWindow<'_>]) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    number(&mut bytes, after.0 as usize);
+    number(&mut bytes, windows.len());
+    for window in windows {
+        number(&mut bytes, window.history.len());
+        number(&mut bytes, window.tokens.len());
+        for token in window.history.iter().chain(window.tokens) {
+            bytes.extend_from_slice(&token.to_le_bytes());
+        }
+    }
+    (bytes.len() <= MAX_PACKET).then_some(bytes)
+}
+
+/// Decode [`announcement`] into the fence and each window's history and tokens.
+pub(super) fn read_announcement(bytes: &[u8]) -> Result<(Fence, Vec<(Vec<u32>, Vec<u32>)>)> {
+    let mut reader = Reader(bytes);
+    let after = Fence(reader.number()? as u64);
+    // Every window carries two counts, so the packet bounds their number.
+    let count = reader.number()?;
+    if count > reader.0.len() / 16 {
+        return Err(invalid("invalid rank announcement window count"));
+    }
+    fn tokens(reader: &mut Reader<'_>, count: usize) -> Result<Vec<u32>> {
+        let nbytes = count
+            .checked_mul(4)
+            .ok_or_else(|| invalid("rank announcement window exceeds host range"))?;
+        Ok(reader
+            .bytes(nbytes)?
+            .chunks_exact(4)
+            .map(|token| u32::from_le_bytes(token.try_into().unwrap()))
+            .collect())
+    }
+    let mut windows = Vec::new();
+    for _ in 0..count {
+        let history = reader.number()?;
+        let following = reader.number()?;
+        let history = tokens(&mut reader, history)?;
+        windows.push((history, tokens(&mut reader, following)?));
+    }
+    reader.end()?;
+    Ok((after, windows))
 }
 
 pub(super) fn completion(value: &FrameCompletion) -> Vec<u8> {

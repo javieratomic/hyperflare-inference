@@ -403,6 +403,81 @@
     when every rank shows identical results and transfer byte counts match the
     cache geometry.
 
+[ ] Qualify embedding row read-ahead on cold DeepSeek V4.1 prefill with disk
+    tables, against a build without row read-ahead with the same core and
+    flags: request time, flare_replay_readiness_wait_nanoseconds_total, and
+    the flare_engram_gather, disk and prefetch counters, with identical output
+    tokens. Cover one request, two, three and four requests that prefill at
+    once, requests that arrive while others prefill, and one and two requests
+    that prefill beside decode streams, under the default and the throughput
+    policy. Close when
+    request time and readiness wait are no worse in every case, and unused
+    rows (flare_engram_prefetch_unused_total) stay below a stated fraction of
+    rows read (flare_engram_prefetch_rows_total). /metrics reports these
+    counters for rank zero's delivery group only, so the fraction describes
+    that group; the other ranks derive their rows from the same announcements.
+    The reader, its thread, the row derivation, the prefill order and the rank
+    packet have unit coverage only.
+
+[ ] Compare the rows that helios/src/engram.rs derives from prompt tokens
+    with the rows a captured graph publishes for the same tokens, end to end.
+    No test makes that comparison: unit tests check the derivation against
+    vectors computed from b12x's reference equation, and serving shows a
+    mismatch only as flare_engram_prefetch_unused_total approaching
+    flare_engram_prefetch_rows_total. A mismatch cannot change a graph input,
+    because a gather delivers the rows its graph publishes; it would make
+    read-ahead read rows that no gather takes. The CUDA test of embedding
+    delivery can also drive an announcement from the serving worker through
+    each executor and its rank packet to a table reader, a path that no test
+    without a GPU reaches. Close when that test asserts, for every table that
+    reads ahead and on every rank, that the derived rows equal the published
+    rows, and that a gather after an announcement is served from rows read
+    ahead.
+
+[ ] Decide where the row derivation of embedding read-ahead belongs.
+    helios/src/engram.rs evaluates the XOR-modulo n-gram hash natively to
+    predict the rows a captured graph will request; the execution manifest
+    specifies the equation, which repeats the one Ignition captures in the
+    graph. It is the only hash method derived: tables with EOS-bounded hashes
+    do not read ahead. AGENTS.md keeps model computation in Ignition and its
+    captured programs, and row read-ahead is on whenever a disk table has a
+    row cache, before the qualification above. Close when the maintainers
+    either accept a native derivation specified by the manifest for each hash
+    method that reads ahead, or replace it with prepared data or a captured
+    graph that supplies the rows, and decide whether read-ahead stays on
+    before it is qualified.
+
+[ ] Run the cargo-mutants selection of
+    verification/helios-lifecycle/README.md, which names
+    announcement_released in helios/src/execution/threaded/protocol.rs. It
+    has not been run with that helper. Close when the selection leaves no
+    surviving mutation.
+
+[ ] Keep a request in the prefill order of embedding row read-ahead while it
+    captures a checkpoint at a message boundary. RequestScheduler::prefill_order
+    lists requests in the prefill phase only, so when another request's step
+    is submitted during the capture, the announcement omits the capturing
+    request: the rows held for it are dropped, and its next step reads its
+    rows inside the gather. A request prefilling alone is unaffected. Close
+    when the order lists such a request, and the scheduler test with message
+    boundaries serves a request unlisted only on its first prefill step.
+
+[ ] Make embedding row read-ahead yield the disk across the rank groups of one
+    host. A reader waits for the gathers in flight of its own group only, so
+    with several partitioned ranks on one host the read-ahead of one rank can
+    compete with a gather of another. Hosts with one rank are unaffected.
+    Close when a reader also waits for the gathers in flight of the other
+    rank groups on its host, with a test of two groups.
+
+[ ] Read ahead the rows of every request's first prefill step and of tables
+    with EOS-bounded hashes (Qwen PLE). Only a submitted prefill step
+    announces, so a first step is announced only when another request's step
+    is submitted while its request waits to prefill; otherwise its rows are
+    read while its graph waits. helios/src/engram.rs derives XOR-modulo rows
+    only. Close when admission announces a request's first step and the
+    EOS-bounded hash is derived natively, each with the tests the XOR-modulo
+    derivation has.
+
 [ ] Add a fault-injection test across rank processes for sharded-store partial
     failure: when one rank fails a store, rank zero unlinks the other ranks'
     files. Only the bookkeeping has unit coverage.

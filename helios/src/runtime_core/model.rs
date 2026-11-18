@@ -780,11 +780,28 @@ impl NativeModel {
                     .filter(|(_, rank)| *rank == 0)
                     .map(|(shared, _)| shared.cache_bytes())
                     .sum();
+                // Rows that one step requests from the tables that could read ahead, and
+                // the rows their read-ahead holds.
+                let (step_rows, read_ahead_rows) = model
+                    .engram
+                    .iter()
+                    .filter(|(_, rank)| *rank == 0)
+                    .map(|(shared, _)| shared.read_ahead_rows())
+                    .fold((0, 0), |sum, rows| (sum.0 + rows.0, sum.1 + rows.1));
+                let read_ahead = match (step_rows, read_ahead_rows) {
+                    (0, _) => String::new(),
+                    (_, 0) if cache_bytes == 0 => " · no read-ahead without a row cache".into(),
+                    (_, 0) => " · no read-ahead: row cache too small".into(),
+                    (step, held) if held < step => format!(
+                        " · read-ahead holds up to {held} of {step} rows: row cache too small for more"
+                    ),
+                    (_, held) => format!(" · read-ahead holds up to {held} rows"),
+                };
                 phase.finish(if cache_bytes == 0 {
-                    label.to_owned()
+                    format!("{label}{read_ahead}")
                 } else {
                     format!(
-                        "{label} · {:.0} MiB row cache",
+                        "{label} · {:.0} MiB row cache{read_ahead}",
                         cache_bytes as f64 / (1u64 << 20) as f64
                     )
                 });

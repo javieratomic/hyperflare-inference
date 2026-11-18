@@ -12,7 +12,9 @@ mod wire;
 
 use std::{time::Instant, collections::VecDeque};
 
-use super::{ExecutionManifest, FrameCompletion, GraphExecutor, OwnedUpload, RankStream, Upload};
+use super::{
+    ExecutionManifest, FrameCompletion, GraphExecutor, OwnedUpload, PromptWindow, RankStream, Upload,
+};
 use crate::{Error, Result, Shutdown, cache::Fence};
 use wire::*;
 
@@ -63,11 +65,41 @@ fn window_available(pending: &VecDeque<Pending>, grammar: bool, manifest: &Execu
             manifest.graphs[frame.graph].kind, super::GraphKind::Decode | super::GraphKind::Speculative))
 }
 
+/// Whether the announcement that follows the submission of `after` may leave: no rank
+/// still has that submission to commit. A submission that is no longer pending was
+/// committed before it completed.
+fn announcement_released(pending: &VecDeque<Pending>, after: Fence) -> bool {
+    !pending.iter().any(|frame| frame.fence == after && !frame.committed)
+}
+
 fn identity(fence: Fence, graph: usize) -> Vec<u8> {
     let mut bytes = Vec::new();
     number(&mut bytes, fence.0 as usize);
     number(&mut bytes, graph);
     bytes
+}
+/// A peer's greeting: its rank, the world size, whether its embedding tables read rows
+/// ahead, and its layout.
+fn hello(rank: usize, world: usize, reads_ahead: bool, layout: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    number(&mut bytes, rank);
+    number(&mut bytes, world);
+    number(&mut bytes, usize::from(reads_ahead));
+    bytes.extend_from_slice(layout);
+    bytes
+}
+/// Check the greeting of the peer expected as `rank` of `world` against rank zero's
+/// `layout`, and return whether the peer's embedding tables read rows ahead.
+fn read_hello(bytes: &[u8], rank: usize, world: usize, layout: &[u8]) -> Result<bool> {
+    let mut reader = Reader(bytes);
+    let identity = (reader.number()?, reader.number()?);
+    let reads_ahead = reader.number()?;
+    if identity != (rank, world) || reads_ahead > 1 || reader.0 != layout {
+        return Err(invalid(
+            "tensor-parallel rank identity, graph I/O schema, or cache ownership layout differs",
+        ));
+    }
+    Ok(reads_ahead == 1)
 }
 fn read_identity(bytes: &[u8]) -> Result<(Fence, usize)> {
     let mut reader = Reader(bytes);
@@ -82,6 +114,12 @@ pub struct TensorParallelExecutor {
     local: GraphExecutor,
     peers: Vec<Peer>,
     pending: VecDeque<Pending>,
+    /// The announcement that follows a submission not yet committed on every rank: the
+    /// submission's fence, the packet for the peers, and the windows for this rank.
+    announcement: Option<(Fence, Vec<u8>, Vec<(Vec<u32>, Vec<u32>)>)>,
+    /// Whether the embedding tables of any rank read rows ahead, as each peer reported
+    /// when it joined.
+    reads_ahead: bool,
     poison: Option<Error>,
     shutdown: Option<Shutdown>,
 }
@@ -103,15 +141,11 @@ impl TensorParallelExecutor {
         wire::validate_completion_packet(&manifest)?;
         let expected = layout(&manifest);
         let mut peers = Vec::new();
+        let mut reads_ahead = false;
         for (index, socket) in sockets.into_iter().enumerate() {
             let mut channel = Channel::new(socket)?;
             let hello = channel.receive(HELLO)?;
-            let mut reader = Reader(&hello);
-            if reader.number()? != index + 1 || reader.number()? != world || reader.0 != expected {
-                return Err(invalid(
-                    "tensor-parallel rank identity, graph I/O schema, or cache ownership layout differs",
-                ));
-            }
+            reads_ahead |= read_hello(&hello, index + 1, world, &expected)?;
             peers.push(Peer {
                 channel,
             });
@@ -180,9 +214,11 @@ impl TensorParallelExecutor {
             return Err(error);
         }
         Ok(Self {
+            reads_ahead: reads_ahead || local.reads_ahead(),
             local,
             peers,
             pending: VecDeque::with_capacity(2),
+            announcement: None,
             poison: None,
             shutdown: None,
         })
@@ -260,6 +296,53 @@ impl TensorParallelExecutor {
         Ok(Some(fence))
     }
 
+    /// See [`GraphExecutor::read_ahead_extent`]. Each rank process has its own host's
+    /// table storage and row cache, and tells rank zero in its greeting whether its
+    /// tables read ahead. There is an extent when any rank's do: a peer may read ahead
+    /// where rank zero does not.
+    pub fn read_ahead_extent(&self) -> Option<super::ReadAheadExtent> {
+        self.local
+            .read_ahead_extent()
+            .filter(|_| self.reads_ahead)
+    }
+
+    /// Announce on every rank the prompt tokens expected to follow `after`; see
+    /// [`GraphExecutor::announce`]. Each rank derives the rows of its own table partition.
+    /// The announcement leaves once every rank has committed the submission of `after`,
+    /// so it neither delays that commit nor reaches a rank that will not run it. It
+    /// replaces one still waiting. A failure to send it poisons the executor: the next
+    /// poll or submission returns the error, before the step in flight completes.
+    pub fn announce(&mut self, after: Fence, windows: &[PromptWindow<'_>]) {
+        if self.poison.is_some() || self.shutdown.is_some() || self.read_ahead_extent().is_none() {
+            return;
+        }
+        // An announcement too large for one control packet is dropped, as any prediction may be.
+        let Some(packet) = wire::announcement(after, windows) else {
+            return;
+        };
+        let windows = windows.iter()
+            .map(|window| (window.history.to_vec(), window.tokens.to_vec())).collect();
+        self.announcement = Some((after, packet, windows));
+        self.send_announcement();
+    }
+
+    fn send_announcement(&mut self) {
+        let Some((after, _, _)) = &self.announcement else { return; };
+        if !announcement_released(&self.pending, *after) {
+            return;
+        }
+        let Some((after, packet, windows)) = self.announcement.take() else { return; };
+        for peer in &mut self.peers {
+            if let Err(error) = peer.channel.send(ANNOUNCE, &packet) {
+                self.poison = Some(error);
+                return;
+            }
+        }
+        let windows: Vec<_> = windows.iter()
+            .map(|(history, tokens)| PromptWindow { history, tokens }).collect();
+        self.local.announce(after, &windows);
+    }
+
     pub fn poll(&mut self) -> Result<Option<FrameCompletion>> {
         if let Some(error) = &self.poison {
             return Err(error.clone());
@@ -268,8 +351,10 @@ impl TensorParallelExecutor {
             return Err(invalid("tensor-parallel executor is closed"));
         }
         match self.poll_ranks() {
-            Ok(None) => Ok(None),
-            Ok(Some(completion)) => Ok(Some(completion)),
+            Ok(completion) => {
+                self.send_announcement();
+                Ok(completion)
+            }
             Err(error) => {
                 self.poison = Some(error.clone());
                 Err(error)
@@ -526,11 +611,8 @@ pub unsafe fn serve_rank(
         }
         let mut channel = Channel::new(socket)?;
         let result = (|| -> Result<()> {
-            let mut hello = Vec::new();
-            number(&mut hello, rank);
-            number(&mut hello, world);
-            hello.extend(layout(executor.manifest()));
-            channel.send(HELLO, &hello)?;
+            let greeting = hello(rank, world, executor.reads_ahead(), &layout(executor.manifest()));
+            channel.send(HELLO, &greeting)?;
             for index in executor.manifest().referenced_tuning_graphs() {
                 let Some(bytes) = startup_message(&mut channel, &mut executor, TUNE)? else { return Ok(()); };
                 let mut reader = Reader(&bytes);
@@ -599,6 +681,12 @@ pub unsafe fn serve_rank(
                                 return Err(invalid("rank lost its prepared submission"));
                             }
                             started.push_back(Instant::now());
+                        }
+                        ANNOUNCE => {
+                            let (after, windows) = wire::read_announcement(&bytes)?;
+                            let windows: Vec<_> = windows.iter()
+                                .map(|(history, tokens)| PromptWindow { history, tokens }).collect();
+                            executor.announce(after, &windows);
                         }
                         _ => return Err(invalid("unexpected rank command")),
                     }

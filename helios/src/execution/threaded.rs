@@ -6,7 +6,7 @@
 
 //! Coordinated CUDA ranks sharing one process address space.
 
-use super::{ExecutionManifest, FrameCompletion, GraphExecutor, OwnedUpload, Upload};
+use super::{ExecutionManifest, FrameCompletion, GraphExecutor, OwnedUpload, PromptWindow, Upload};
 use crate::{Error, ExecutionError, Result, Shutdown, cache::Fence};
 use std::{
     collections::VecDeque,
@@ -68,6 +68,8 @@ enum Command {
     FinishStartup,
     Prepare(Arc<Step>),
     Commit(Fence, usize),
+    /// Prompt windows expected to follow the fence: each one's history, then its tokens.
+    Announce(Fence, Arc<Vec<(Vec<u32>, Vec<u32>)>>),
     Drain,
 }
 enum Reply {
@@ -108,6 +110,8 @@ pub(crate) struct ThreadedExecutor {
     local: GraphExecutor,
     peers: Vec<Peer>,
     pending: VecDeque<Pending>,
+    /// The announcement that follows a submission not yet committed on every rank.
+    announcement: Option<(Fence, Arc<Vec<(Vec<u32>, Vec<u32>)>>)>,
     poison: Option<Error>,
     shutdown: Option<Shutdown>,
 }
@@ -130,6 +134,7 @@ impl ThreadedExecutor {
             local,
             peers: Vec::new(),
             pending: VecDeque::with_capacity(2),
+            announcement: None,
             poison: None,
             shutdown: None,
         };
@@ -317,13 +322,55 @@ impl ThreadedExecutor {
         }
         Ok(Some(fence))
     }
+    /// See [`GraphExecutor::read_ahead_extent`]. The ranks of one process run with the
+    /// same table storage and row cache, so there is an extent only when the first
+    /// rank's tables read ahead.
+    #[cfg(feature = "server")]
+    pub fn read_ahead_extent(&self) -> Option<super::ReadAheadExtent> {
+        self.local
+            .read_ahead_extent()
+            .filter(|_| self.local.reads_ahead())
+    }
+    /// Announce on every rank the prompt tokens expected to follow `after`; see
+    /// [`GraphExecutor::announce`]. Ranks sharing one table reader announce once. The
+    /// announcement leaves once every rank has committed the submission of `after`. A
+    /// failure to send it poisons the executor: the next poll or submission returns the
+    /// error, before the step in flight completes.
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
+    pub fn announce(&mut self, after: Fence, windows: &[PromptWindow<'_>]) {
+        if self.poison.is_some() || self.shutdown.is_some() || !self.local.reads_ahead() {
+            return;
+        }
+        let windows = Arc::new(windows.iter()
+            .map(|window| (window.history.to_vec(), window.tokens.to_vec())).collect::<Vec<_>>());
+        self.announcement = Some((after, windows));
+        self.send_announcement();
+    }
+    fn send_announcement(&mut self) {
+        let Some((after, _)) = &self.announcement else { return; };
+        if !protocol::announcement_released(&self.pending, *after) {
+            return;
+        }
+        let Some((after, windows)) = self.announcement.take() else { return; };
+        for peer in &self.peers {
+            if let Err(error) = peer.send(Command::Announce(after, windows.clone())) {
+                self.poison = Some(error);
+                return;
+            }
+        }
+        let windows: Vec<_> = windows.iter()
+            .map(|(history, tokens)| PromptWindow { history, tokens }).collect();
+        self.local.announce(after, &windows);
+    }
     pub fn poll(&mut self) -> Result<Option<FrameCompletion>> {
         if let Some(error) = &self.poison {
             return Err(error.clone());
         }
         match self.poll_ranks() {
-            Ok(None) => Ok(None),
-            Ok(Some(completion)) => Ok(Some(completion)),
+            Ok(completion) => {
+                self.send_announcement();
+                Ok(completion)
+            }
             Err(error) => {
                 self.poison = Some(error.clone());
                 Err(error)
@@ -481,6 +528,11 @@ fn rank_loop(
                     return Err(invalid("rank fence changed after validation"));
                 }
                 started.push_back(Instant::now());
+            }
+            Some(Command::Announce(after, windows)) => {
+                let windows: Vec<_> = windows.iter()
+                    .map(|(history, tokens)| PromptWindow { history, tokens }).collect();
+                executor.announce(after, &windows);
             }
             Some(Command::Drain) => {
                 if prepared.is_some() || executor.outstanding() != 0 { return Err(invalid("rank drain arrived with outstanding frames")); }
@@ -677,6 +729,7 @@ mod tests {
                                 hashes: "hashes".into(),
                                 event: "ready".into(),
                                 request: Some("requests".into()),
+                                hash: None,
                             }],
                         },
                         if partitioned { 1 } else { 4 },
@@ -779,6 +832,7 @@ mod tests {
                         }),
                         heads: 24, weights: "weights".into(), scales: "scales".into(),
                         hashes: "hashes".into(), event: "ready".into(), request: Some("requests".into()),
+                        hash: None,
                     }] }, if partitioned { 1 } else { 4 })
                 }).collect();
                 let ranks: Vec<_> = (0..4).map(|rank| {

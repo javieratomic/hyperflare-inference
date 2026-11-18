@@ -137,6 +137,11 @@ impl RowCache {
         first..first + WAYS
     }
 
+    /// Whether `id` is resident, without counting a use or refreshing its recency.
+    pub fn contains(&self, id: i64) -> bool {
+        self.set(id).any(|slot| self.entries[slot].id == id)
+    }
+
     pub fn get(&mut self, id: i64) -> Option<&[u8]> {
         self.frequency.observe(id);
         let slot = self.set(id).find(|&slot| self.entries[slot].id == id)?;
@@ -222,6 +227,27 @@ mod tests {
         let result = cache.insert(4, &[9, 19], &[44]);
         assert!(!result.added && !result.evicted);
         assert_eq!(cache.get(4), Some(&[9, 19, 44][..]));
+    }
+
+    #[test]
+    fn residency_probes_count_no_use_and_keep_recency() {
+        let mut cache = RowCache::new(16 + 4 * (size_of::<Entry>() + 3), 100, 3).unwrap();
+        for id in 0..4 {
+            cache.insert(id, &[id as u8, 17], &[42]);
+        }
+        let (clock, samples) = (cache.clock, cache.frequency.samples);
+        let counters = cache.frequency.counters.clone();
+        for _ in 0..8 {
+            assert!(cache.contains(0));
+            assert!(!cache.contains(4));
+        }
+        assert_eq!((cache.clock, cache.frequency.samples), (clock, samples));
+        assert_eq!(cache.frequency.counters, counters);
+        // Row 0 is still the least recently used, so an equally frequent row replaces it.
+        let result = cache.insert(4, &[4, 18], &[43]);
+        assert!(result.evicted);
+        assert!(!cache.contains(0));
+        assert!(cache.contains(4));
     }
 
     #[test]

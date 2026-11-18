@@ -742,7 +742,7 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--mtp-verification-token-budget N` | Select one exact captured packed verification capacity per batch | All captured capacities |
 | `--mtp-max-verification-token-budget N` | Retain all captured packed verification capacities at or below a total-row ceiling | All captured capacities |
 | `--embedding-table-storage disk\|ram` | PLE and Engram table storage; both modes deliver compact GPU rows | `disk` |
-| `--embedding-table-cache-size SIZE` | Per-host RAM budget for cached disk-backed PLE/Engram rows, including the index, usage counters and miss workspace; accepts sizes such as `1G` or `2GiB`; `0` disables | `4GiB` on discrete GPUs; `1GiB` on unified-memory GPUs such as DGX Spark |
+| `--embedding-table-cache-size SIZE` | Per-host RAM budget for cached disk-backed PLE/Engram rows, including the index, usage counters, miss workspace and rows read ahead of prefill; accepts sizes such as `1G` or `2GiB`; `0` disables the cache and read-ahead | `4GiB` on discrete GPUs; `1GiB` on unified-memory GPUs such as DGX Spark |
 | `--embedding-table-resident-scales` / `--no-embedding-table-resident-scales` | Keep original embedding scale bytes in host RAM while weights remain on disk; adds to the row-cache budget | Enabled on discrete GPUs; disabled on unified-memory GPUs |
 | `--prefix-cache-memory SIZE` | Warm host memory for prefix checkpoints and prepared inputs, such as `16G`; `0` disables warm retention | `[prefix_cache] memory`, otherwise `0` |
 | `--prefix-cache-disk DIR` | Directory for prefix checkpoints and prepared inputs on disk | `[paths] prefix_cache`, otherwise disabled |
@@ -780,7 +780,13 @@ table catalog. Each host shares its budget across embedding tables and local
 tensor-parallel ranks. The loader commits cache memory before
 sizing KV and continuation pools, so the cache uses part of the integrated GPU's
 memory budget. The cache remains fixed in size while serving and warms
-from requests each time the server starts.
+from requests each time the server starts. On Linux, each table whose rows the
+host can derive from prompt tokens also reserves, inside its share of the
+budget, room for the rows one step of the widest graph requests from the rank,
+which it [reads ahead](../helios/README.md#row-read-ahead). The reservation
+takes at most a quarter of the bytes the share leaves for cached rows, so a
+small budget reads ahead fewer rows or none; the loader's embedding-table
+summary states which. The serving effect of read-ahead is not qualified.
 
 `--embedding-table-resident-scales` loads the original scale plane into immutable
 host RAM before KV sizing. Disk-backed tables enable this by default unless any

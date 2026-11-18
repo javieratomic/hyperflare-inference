@@ -538,7 +538,8 @@ message MimoImageSettings {
   repeated float image_std = 4;
 }
 message Engram {
-  // Raw token ID to normalized vocabulary ID; normalization runs only during preparation.
+  // Raw token ID to normalized vocabulary ID. Captured graphs normalize tokens themselves;
+  // Helios applies this map only to derive the rows that row read-ahead reads.
   repeated uint32 token_map = 1;
   uint32 pad_token_id = 2;
   uint32 compressed_vocabulary = 3;

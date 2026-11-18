@@ -148,6 +148,14 @@ The 15-integer projection contains submission/removal counts and each pending
 frame's fence, graph, barrier, readiness mask, commitment marker, and completion
 mask. TLC checks observed helper transitions against `RankProtocol.AllowedEdge`.
 
+`announcement_released` in the same file is outside the model. It tells when
+rank zero may send the prompt tokens that embedding row read-ahead predicts
+for the steps after a submission: once no rank has that submission left to
+commit. The announcement changes no frame state, needs no acknowledgment, and
+a rank that never receives it serves the same rows. The ordinary test
+`an_announcement_waits_for_the_commit_of_the_submission_it_follows` checks the
+predicate and contributes no observed transition.
+
 The commitment transition represents the marker set after successful peer
 dispatch and local submission. CPU exploration checks its eligibility predicate;
 it does not execute the CUDA calls around that marker. Peer completion insertion
@@ -408,7 +416,7 @@ Install cargo-mutants 27.1.0, then run the scoped rank-helper selection:
 ```sh
 TMPDIR="$PWD" cargo mutants --manifest-path helios/Cargo.toml --no-config \
   --file src/execution/threaded/protocol.rs \
-  --re '(ready_to_commit|pop_completed_front|dispatch_commit)' \
+  --re '(ready_to_commit|pop_completed_front|dispatch_commit|announcement_released)' \
   --test-tool cargo --test-workspace=false --gitignore=false --cap-lints=false \
   --jobs 1 --jobserver-tasks 4 --build-timeout 300 --timeout 30 \
   --output /tmp/flare-protocol-mutants --cargo-arg=--lib \

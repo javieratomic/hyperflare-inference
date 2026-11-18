@@ -388,10 +388,33 @@ readiness events. Each table has two pinned payload frames and ready flags.
 Each rank queues its readiness wait, compact H2D copies, and event record before
 launching the consumer. Transfer N+1 waits for the compute-stream start event
 following graph N, protecting reusable device scratch. A host frame is reusable
-only after every participating rank completes its consumer. Shutdown drains row
+only after every participating rank completes its consumer. Between gathers a
+reader may read rows that announced prompt windows predict for the following
+steps; these reads use no staging frame and yield to a submitted gather, as
+[row read-ahead](README.md#row-read-ahead) describes. Shutdown drains row
 copy, model, and completion streams; their owners survive an unconfirmed drain.
 The core memory budget includes both host staging frames once per shared
 rank group.
+
+An Engram table with hash method `XOR_MODULO` declares one multiplier per lag
+and, per lookup head in output-column order, an n-gram order, a prime and a row
+offset. The token map gives every raw token ID below its length a normalized
+ID; any other ID is outside the vocabulary. For the token at position `p` of a
+prompt, lag `k` names the token at `p - k`, and positions before the prompt
+read as the raw token `pad_token_id`. A head of order `n` computes
+`m = t[0] * multiplier[0] XOR ... XOR t[n-1] * multiplier[n-1]` over 64-bit
+integers, where `t[k]` is the normalized ID of lag `k`, or the normalized ID of
+`pad_token_id` for lag `k` and every higher lag once a lag up to `k` is outside
+the vocabulary. The head's row is `offset + m mod prime`. No product overflows:
+loading rejects a multiplier whose product with the normalized vocabulary size
+exceeds the signed 64-bit range. For a partitioned table the offsets index its
+partitions concatenated in rank order, and a rank's requests are
+partition-local: `offset - first_row + m mod prime` for the heads whose rows
+its partition stores and -1 for the others. Captured graphs compute these rows
+and publish them through the request mailbox; a gather delivers the published
+rows. Helios evaluates the same equation on prompt tokens only to read rows
+ahead of the graphs that request them. `EOS_XOR_MODULO` rows are computed by
+graphs only.
 
 Graph declarations specify operation, sampling mode, B/D/W/P, confidence output
 extent, and mixed prefill extent. D describes actual captured proposal work,

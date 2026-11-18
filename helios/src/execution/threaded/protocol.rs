@@ -80,6 +80,15 @@ pub(super) fn ready_to_commit(frame: &Pending) -> bool {
     !frame.committed && frame.ready.iter().all(|ready| *ready)
 }
 
+/// Whether the announcement that follows the submission of `after` may leave: no rank
+/// still has that submission to commit. A submission that is no longer pending was
+/// committed before it completed.
+pub(super) fn announcement_released(pending: &VecDeque<Pending>, after: Fence) -> bool {
+    !pending
+        .iter()
+        .any(|frame| frame.step.fence == after && !frame.committed)
+}
+
 pub(super) fn dispatch_commit(peers: &[Peer], fence: Fence, graph: usize) -> Result<()> {
     for peer in peers {
         peer.send(Command::Commit(fence, graph))?;

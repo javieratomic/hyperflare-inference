@@ -1048,6 +1048,9 @@ struct Worker<'a> {
     image_preparation: Option<ImagePreparation>,
     preparing_image: Option<RequestHandle>,
     image_preparation_cursor: usize,
+    /// How the order announced for embedding row read-ahead has matched the prefill
+    /// steps that followed.
+    prefill_guesses: PrefillGuesses,
     prefill_started: VecDeque<(crate::cache::Fence, std::time::Instant, u64)>,
 }
 
@@ -1085,6 +1088,7 @@ impl<'a> Worker<'a> {
             image_preparation: None,
             preparing_image: None,
             image_preparation_cursor: 0,
+            prefill_guesses: Default::default(),
         }
     }
 
@@ -2258,11 +2262,56 @@ impl<'a> Worker<'a> {
         {
             return Err("executor refused a reserved scheduler submission".into());
         }
+        self.announce_prefill(executor, step, fence);
         observe_submission(self.metrics, &self.scheduler, step, executor.outstanding())?;
         self.metrics
             .scheduler_trace
             .submitted(super::observation::monotonic_ns(), graph, step, feedback);
         Ok(true)
+    }
+
+    /// Announce to every rank the prompt tokens that the steps after `step` are expected
+    /// to prefill, so that disk-backed embedding tables read their rows while the graph
+    /// submitted at `fence` runs. The scheduler's [`RequestScheduler::prefill_order`]
+    /// gives the order of the prompts, and [`PrefillGuesses`] withholds the announcement
+    /// while that order has been failing among several requests. A wrong prediction
+    /// costs disk reads and changes no graph input. The announcement does not delay the
+    /// step it follows. An executor that cannot send it to a rank is poisoned, and
+    /// returns the error from its next poll or submission.
+    fn announce_prefill(
+        &mut self,
+        executor: &mut RankExecutor,
+        step: &ScheduledPlan,
+        fence: crate::cache::Fence,
+    ) {
+        let Some(extent) = executor.read_ahead_extent() else {
+            return;
+        };
+        let served: Vec<_> = step
+            .lanes
+            .iter()
+            .enumerate()
+            .filter(|(row, _)| step.lane_kind(*row).is_prefill())
+            .map(|(_, lane)| lane)
+            .collect();
+        let Some(width) = served.iter().map(|lane| lane.tokens).max() else {
+            return;
+        };
+        let order = self.scheduler.prefill_order(fence);
+        let scheduler = &self.scheduler;
+        let (position, announce) = self.prefill_guesses.observe(
+            served.iter().map(|lane| lane.request),
+            order.iter().map(|&(request, _)| request),
+            |request| scheduler.request(request).is_ok(),
+        );
+        self.metrics.prefill_guess(position, announce);
+        if !announce {
+            return;
+        }
+        let windows = following_prefill(width, &self.admissions, &order, extent);
+        if !windows.is_empty() {
+            executor.announce(fence, &windows);
+        }
     }
 
     /// Copy newly ready checkpoints out and apply finished host transfers.
@@ -2812,6 +2861,141 @@ fn validate_sampling_admissions(
     Ok(())
 }
 
+/// Where the request served by a prefill step stood in the order announced after the
+/// preceding prefill step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum GuessPosition {
+    /// At this index of the order, `LATER` standing for every index from it on.
+    Listed(usize),
+    /// Not in the order: the request was not prefilling when it was made.
+    Unlisted,
+}
+
+impl GuessPosition {
+    /// The index that stands for itself and every later one.
+    pub(super) const LATER: usize = 3;
+}
+
+/// How the order announced for embedding row read-ahead has matched the prefill steps
+/// that followed.
+///
+/// The read-ahead holds the rows of about one step, so a prefill step that serves
+/// another request than the one listed first finds none of its rows held, and the rows
+/// read for the listed one are dropped if a later announcement lists another request
+/// first. A wrong order therefore adds disk reads without saving any. While more than
+/// `TOLERATED` of the last eight guesses among several requests were wrong, nothing is
+/// announced for several requests; the order is still scored against every prefill
+/// step, and announcements resume once enough of the last eight guesses were right.
+///
+/// A guess is scored among the requests of its order that are still live, so a
+/// cancelled request is not a wrong guess. A request served although the order did not
+/// list it was not prefilling when the order was made: no order could have listed it,
+/// and the step counts neither way. A single prefilling request is always announced,
+/// and the record of wrong guesses is cleared whenever an order names fewer than two
+/// requests: it describes one episode of requests prefilling at once.
+#[derive(Default)]
+struct PrefillGuesses {
+    /// The requests expected to prefill after the last prefill step, soonest first.
+    expected: Vec<RequestHandle>,
+    /// The last eight guesses made among several requests, the newest in the lowest bit:
+    /// set where the step served a listed request other than the first.
+    missed: u8,
+}
+
+impl PrefillGuesses {
+    /// Wrong guesses among the last eight up to which several requests are announced.
+    const TOLERATED: u32 = 2;
+
+    /// Score the order recorded at the preceding prefill step against the requests that
+    /// the step now submitted `served`, and record `order` as the guess for the step that
+    /// follows. `live` tells whether a request of the preceding order still exists.
+    /// Returns where the served request stood among the live requests of the preceding
+    /// order, if any is left, and whether to announce `order`.
+    fn observe(
+        &mut self,
+        served: impl Iterator<Item = RequestHandle>,
+        order: impl Iterator<Item = RequestHandle>,
+        live: impl Fn(RequestHandle) -> bool,
+    ) -> (Option<GuessPosition>, bool) {
+        self.expected.retain(|&request| live(request));
+        let position = (!self.expected.is_empty()).then(|| {
+            served
+                .filter_map(|request| self.expected.iter().position(|&listed| listed == request))
+                .min()
+                .map_or(GuessPosition::Unlisted, |index| {
+                    GuessPosition::Listed(index.min(GuessPosition::LATER))
+                })
+        });
+        if let (Some(GuessPosition::Listed(index)), true) = (position, self.expected.len() > 1) {
+            self.missed = self.missed << 1 | u8::from(index != 0);
+        }
+        self.expected.clear();
+        self.expected.extend(order);
+        if self.expected.len() < 2 {
+            self.missed = 0;
+        }
+        let announce = self.missed.count_ones() <= Self::TOLERATED;
+        (position, announce)
+    }
+}
+
+/// Prompt tokens that the steps after a submitted prefill step are expected to prefill,
+/// most urgent window first, each preceded by up to `extent.history` tokens of its
+/// prompt. `order` names the requests that still consume their prompts once that step
+/// completes, soonest expected first, each with the position it will have reached;
+/// `width` is the number of tokens that the step's widest prefill lane took.
+///
+/// A prompt is fixed at admission and consumed in order, but the scheduler chooses each
+/// step's request and width. The announcement therefore follows positions, not the
+/// submitted step: for every listed prompt it covers one step of the widest graph,
+/// `extent.tokens`, past its position, and the next step of a prompt is expected to be
+/// `width` tokens wide. The windows are, in order: the next step of each request, then
+/// the rest of each extent in the same order. They end after `extent.listed` tokens.
+/// Read-ahead holds fewer rows than the windows list: it reads the earliest ones and
+/// keeps a prompt's rows while announcements still list them, unless the first window
+/// needs their place.
+fn following_prefill<'a>(
+    width: usize,
+    admissions: &'a [Option<crate::model::Admission>],
+    order: &[(RequestHandle, usize)],
+    extent: crate::execution::ReadAheadExtent,
+) -> Vec<crate::execution::PromptWindow<'a>> {
+    let prompts: Vec<(&'a [u32], usize)> = order
+        .iter()
+        .filter_map(|&(request, position)| {
+            let admission = admissions
+                .get(request.slot as usize)?
+                .as_ref()
+                .filter(|admission| admission.handle == request)?;
+            Some((admission.prompt.as_slice(), position))
+        })
+        .collect();
+    let width = width.min(extent.tokens);
+    let mut windows = Vec::new();
+    let mut budget = extent.listed;
+    let mut list = |prompt: &'a [u32], from: usize, to: usize| {
+        let to = to.min(prompt.len()).min(from.saturating_add(budget));
+        if from < to {
+            budget -= to - from;
+            windows.push(crate::execution::PromptWindow {
+                history: &prompt[from.saturating_sub(extent.history)..from],
+                tokens: &prompt[from..to],
+            });
+        }
+    };
+    for &(prompt, position) in &prompts {
+        list(prompt, position, position.saturating_add(width));
+    }
+    for &(prompt, position) in &prompts {
+        list(
+            prompt,
+            position.saturating_add(width),
+            position.saturating_add(extent.tokens),
+        );
+    }
+    windows
+}
+
 fn observe_submission(
     metrics: &super::metrics::Metrics,
     scheduler: &RequestScheduler,
@@ -2841,6 +3025,151 @@ mod tests {
     use super::*;
     use crate::model::{Admission, PromptData};
     use crate::scheduler::SchedulerCapabilities;
+
+    #[test]
+    fn following_prefill_follows_prompt_positions_in_the_expected_order() {
+        use crate::execution::ReadAheadExtent;
+
+        let handle = |slot: usize| RequestHandle { slot: slot as u32, generation: 5 + slot as u64 };
+        // Prompts 0..10, 100..104 and 200..209.
+        let admissions: [Option<Admission>; 3] = std::array::from_fn(|slot| {
+            let prompt: Vec<u32> = (0..[10, 4, 9][slot]).map(|token| 100 * slot as u32 + token).collect();
+            Some(Admission {
+                handle: handle(slot),
+                sampling: SamplingParameters::default(),
+                max_new_tokens: 16,
+                data: PromptData {
+                    positions: vec![[0; 3]; prompt.len()],
+                    vision_token_indices: vec![-1; prompt.len()],
+                    ..Default::default()
+                },
+                prompt,
+                grammar_mask: None,
+                ignore_eos: false,
+                prompt_logprobs: false,
+            })
+        });
+        let (first, third) = (handle(0), handle(2));
+        // Windows after a step `width` tokens wide, with a widest graph of `tokens`
+        // tokens, listing 24 tokens at most.
+        let windows = |width: usize, order: &[(RequestHandle, usize)], history, tokens| {
+            following_prefill(width, &admissions, order, ReadAheadExtent { history, tokens, listed: 24 })
+                .iter()
+                .map(|window| (window.history.to_vec(), window.tokens.to_vec()))
+                .collect::<Vec<(Vec<u32>, Vec<u32>)>>()
+        };
+        // A step narrower than the widest: the next two tokens first, then the rest of
+        // the six tokens past the position, whatever width the following step takes.
+        assert_eq!(windows(2, &[(first, 2)], 3, 6), [
+            (vec![0, 1], vec![2, 3]),
+            (vec![1, 2, 3], vec![4, 5, 6, 7]),
+        ]);
+        // The step after it, again two tokens wide, announces the same tokens but 4 and 5
+        // first, and adds 8 and 9: only their rows are missing from the read-ahead.
+        assert_eq!(windows(2, &[(first, 4)], 3, 6), [
+            (vec![1, 2, 3], vec![4, 5]),
+            (vec![3, 4, 5], vec![6, 7, 8, 9]),
+        ]);
+        // A step as wide as the widest predicts one window of that width.
+        assert_eq!(windows(4, &[(first, 4)], 3, 4), [(vec![1, 2, 3], vec![4, 5, 6, 7])]);
+        assert_eq!(windows(4, &[(first, 4)], 0, 4), [(vec![], vec![4, 5, 6, 7])]);
+        // The prediction ends with the prompt, and no request predicts nothing.
+        assert_eq!(windows(3, &[(first, 9)], 3, 6), [(vec![6, 7, 8], vec![9])]);
+        assert!(windows(3, &[(first, 10)], 3, 6).is_empty());
+        assert!(windows(4, &[], 3, 4).is_empty());
+
+        // Two requests that the scheduler alternates. A step prefilled tokens 0..4 of
+        // the first; the third, waiting at its token 4, is expected next and listed
+        // first, at the submitted width.
+        assert_eq!(windows(4, &[(third, 4), (first, 4)], 3, 4), [
+            (vec![201, 202, 203], vec![204, 205, 206, 207]),
+            (vec![1, 2, 3], vec![4, 5, 6, 7]),
+        ]);
+        // The third request's step then lists the first request's tokens 4..8 again,
+        // unchanged and ahead of its own: the rows read for them stay held.
+        assert_eq!(windows(4, &[(first, 4), (third, 8)], 3, 4), [
+            (vec![1, 2, 3], vec![4, 5, 6, 7]),
+            (vec![205, 206, 207], vec![208]),
+        ]);
+        // Narrower steps: the next step of each request in the order, then the rest of
+        // each extent in the same order.
+        assert_eq!(windows(2, &[(third, 4), (first, 2)], 1, 4), [
+            (vec![203], vec![204, 205]),
+            (vec![1], vec![2, 3]),
+            (vec![205], vec![206, 207]),
+            (vec![3], vec![4, 5]),
+        ]);
+
+        // The listing ends after `listed` tokens, and a request whose admission was
+        // replaced is skipped.
+        let stale = RequestHandle { slot: 1, generation: 99 };
+        let listed = following_prefill(
+            1,
+            &admissions,
+            &[(stale, 0), (third, 0), (first, 1)],
+            ReadAheadExtent { history: 1, tokens: 4, listed: 5 },
+        );
+        let listed: Vec<(Vec<u32>, Vec<u32>)> = listed
+            .iter()
+            .map(|window| (window.history.to_vec(), window.tokens.to_vec()))
+            .collect();
+        assert_eq!(listed, [
+            (vec![], vec![200]),
+            (vec![0], vec![1]),
+            (vec![200], vec![201, 202, 203]),
+        ]);
+    }
+
+    #[test]
+    fn read_ahead_is_withheld_while_the_prefill_order_keeps_failing() {
+        use GuessPosition::{Listed, Unlisted};
+
+        let handle = |slot: u32| RequestHandle { slot, generation: 3 };
+        let [a, b, c, d, e] = [0, 1, 2, 3, 4].map(handle);
+        let mut guesses = PrefillGuesses::default();
+        // Score a step that served `served`, record `order`, with the requests of `gone`
+        // cancelled or finished since the preceding order.
+        let mut observe = |served: RequestHandle, order: &[RequestHandle], gone: &[RequestHandle]| {
+            guesses.observe(std::iter::once(served), order.iter().copied(), |request| {
+                !gone.contains(&request)
+            })
+        };
+        // The first prefill step has no order to score. One prefilling request is always
+        // announced, and a request that was not prefilling when the order was made
+        // counts neither way.
+        assert_eq!(observe(a, &[a], &[]), (None, true));
+        assert_eq!(observe(a, &[a], &[]), (Some(Listed(0)), true));
+        assert_eq!(observe(b, &[a, b], &[]), (Some(Unlisted), true));
+        // Among several requests, two wrong orders in the last eight are tolerated and
+        // the third withholds the announcement.
+        assert_eq!(observe(b, &[a, b], &[]), (Some(Listed(1)), true));
+        assert_eq!(observe(b, &[a, b], &[]), (Some(Listed(1)), true));
+        assert_eq!(observe(b, &[a, b, c, d], &[]), (Some(Listed(1)), false));
+        // The order is still scored while withheld; every index from the fourth on
+        // reports as the fourth.
+        assert_eq!(observe(d, &[a, b, c, d], &[]), (Some(Listed(3)), false));
+        assert_eq!(observe(e, &[a, b, c, d], &[]), (Some(Unlisted), false));
+        // The request listed first was cancelled: the step that serves the next one
+        // listed is a right order.
+        assert_eq!(observe(b, &[b, c, d], &[a]), (Some(Listed(0)), false));
+        // Four wrong orders are on record. Announcements resume once all but two of them
+        // are older than the last eight: with the sixth right order.
+        for _ in 0..4 {
+            assert_eq!(observe(b, &[b, c, d], &[]), (Some(Listed(0)), false));
+        }
+        assert_eq!(observe(b, &[b, c, d], &[]), (Some(Listed(0)), true));
+        // Two wrong orders then withhold nothing, and the third does.
+        assert_eq!(observe(c, &[b, c, d], &[]), (Some(Listed(1)), true));
+        assert_eq!(observe(c, &[b, c, d], &[]), (Some(Listed(1)), true));
+        assert_eq!(observe(c, &[b, c, d], &[]), (Some(Listed(1)), false));
+        // An order of one request is announced and clears the record: the requests that
+        // prefill at once later start with none.
+        assert_eq!(observe(b, &[b], &[]), (Some(Listed(0)), true));
+        assert_eq!(observe(b, &[b, c], &[]), (Some(Listed(0)), true));
+        assert_eq!(observe(c, &[b, c], &[]), (Some(Listed(1)), true));
+        // An order whose requests are all gone scores nothing.
+        assert_eq!(observe(d, &[d], &[b, c]), (None, true));
+    }
 
     #[test]
     fn general_sampler_handles_mixed_positive_temperatures_with_matching_epochs() {

@@ -90,6 +90,26 @@ pub struct Upload<'a> {
     pub bytes: &'a [u8],
 }
 
+/// Prompt tokens that a later submission is expected to prefill, with the tokens that
+/// precede them in the same prompt.
+pub struct PromptWindow<'a> {
+    pub history: &'a [u32],
+    pub tokens: &'a [u32],
+}
+
+/// The prompt tokens that one [`GraphExecutor::announce`] call can use.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReadAheadExtent {
+    /// Preceding tokens that each window should carry.
+    pub history: usize,
+    /// Tokens of one step of the widest graph. The rows of that many tokens are the most
+    /// that read-ahead holds at once.
+    pub tokens: usize,
+    /// Most tokens that one announcement may list, over all windows. It exceeds `tokens`
+    /// so that rows held for one prompt stay listed while the steps of others run.
+    pub listed: usize,
+}
+
 #[cfg(kani)]
 mod kani_proofs;
 
@@ -723,6 +743,50 @@ impl GraphExecutor {
                 .filter(|frame| frame.pending.is_some())
                 .count()
         })
+    }
+
+    /// The extent of the [`PromptWindow`] list that [`Self::announce`] can use, or `None`
+    /// when the table catalog, which every rank shares, has no embedding table whose
+    /// rows are derived from prompt tokens. Whether a rank reads those rows ahead also
+    /// depends on its host's table storage and row cache; [`Self::reads_ahead`] tells
+    /// it for this rank.
+    pub fn read_ahead_extent(&self) -> Option<ReadAheadExtent> {
+        self.manifest
+            .engram
+            .as_ref()
+            .and_then(|binding| binding.shared.read_ahead_extent())
+            .map(|(history, tokens, listed)| ReadAheadExtent {
+                history,
+                tokens,
+                listed,
+            })
+    }
+
+    /// Whether an embedding table of this rank's delivery group reads rows ahead.
+    pub fn reads_ahead(&self) -> bool {
+        self.manifest
+            .engram
+            .as_ref()
+            .is_some_and(|binding| binding.shared.reads_ahead())
+    }
+
+    /// Announce prompt tokens that the submissions following `after` are expected to
+    /// prefill, most urgent window first, so that disk-backed embedding tables read their
+    /// rows while the graph of `after` runs. Rows read for an earlier announcement are
+    /// kept while this one still lists their tokens. Rows are read only into the room
+    /// that leaves, and the rows of the first window also into the room of rows that
+    /// later windows list. The announcement is a
+    /// prediction: each graph still receives exactly the rows it requests. A wrong or
+    /// late announcement costs disk reads, and a read that fails is left to the gather
+    /// that needs its rows.
+    pub fn announce(&self, after: Fence, windows: &[PromptWindow<'_>]) {
+        if let Some(engram) = self
+            .resources
+            .as_ref()
+            .and_then(|resources| resources.engram.as_ref())
+        {
+            engram.announce(after.0, windows);
+        }
     }
 
     /// Validate a coordinated submission without touching CUDA or advancing its fence.

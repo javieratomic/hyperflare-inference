@@ -990,6 +990,97 @@ impl RequestScheduler {
         }
     }
 
+    /// The requests that still have prompt tokens to consume once the submission committed
+    /// at `fence` completes, in the order selection is expected to prefill them, each
+    /// with the prompt position it will have reached. Embedding row read-ahead announces
+    /// prompts in this order. An unknown `fence` gives no requests.
+    ///
+    /// Selection chooses the next request when the submission completes, by the value
+    /// rate of its best prefill graph. The order is by that rate as it stands at
+    /// submission, with the submissions in flight charged to every request's service
+    /// price at their estimated durations, highest first and lowest slot first among
+    /// equal rates, as [`best_cohort`] chooses. A price rises while steps serve other
+    /// requests and falls with service, so when steps last much longer than the policy's
+    /// adaptation time the order is longest waiting first, and a request that started
+    /// to prefill during the preceding step follows those that waited through it.
+    ///
+    /// Two submissions are not charged in advance as their completion charges them: one
+    /// whose graph has no measured duration is charged to no price, and a mixed step
+    /// is charged without the tokens its prompt consumes. The requests of such a
+    /// submission are listed after the others, provided they had a token rate when it
+    /// was committed: without one, completion charges nothing either. Completion puts
+    /// them there when the submission lasts longer than the adaptation time; after a
+    /// shorter one a request can keep the highest price and be served again.
+    ///
+    /// The order is a prediction. A request of the submission is rated at the position
+    /// it had before the submission, and neither the requests that start to prefill
+    /// before it completes nor the difference between its estimated and its measured
+    /// duration are known. Requests are rated by prefill graphs alone: a mixed graph
+    /// takes the prompt worth most at its own prefill capacity, which can differ when
+    /// prompts have unequal steps left.
+    pub fn prefill_order(&self, fence: Fence) -> Vec<(RequestHandle, usize)> {
+        let Some(submission) = self.submissions.get(&fence) else {
+            return Vec::new();
+        };
+        let _checkpoint_selections = self.checkpoint_planning_scope();
+        let (values, age_price, _) = self.lane_values(self.window_remaining().unwrap_or(0));
+        let uncharged =
+            submission.estimated_duration_ns == 0 || submission.step.kind == GraphKind::Mixed;
+        let mut candidates = Vec::new();
+        let mut order = Vec::new();
+        for (slot, entry) in self.slots.iter().enumerate() {
+            let Some(request) = entry
+                .request
+                .as_ref()
+                .filter(|request| request.phase == RequestPhase::Prefill)
+            else {
+                continue;
+            };
+            let lane = submission
+                .step
+                .lanes
+                .iter()
+                .find(|lane| lane.request == request.handle);
+            // A request of the submission is pending until it completes; any other must
+            // be one that selection could choose.
+            if lane.is_none() && !self.eligible(request) {
+                continue;
+            }
+            let position = lane.map_or(request.consumed_tokens as usize, |lane| {
+                lane.start_position as usize + lane.tokens
+            });
+            if position >= request.prompt_tokens {
+                continue;
+            }
+            let kind = request.prefill_kind();
+            candidates.clear();
+            for &capacity in self.prefill_catalog(kind) {
+                self.add_candidate(&mut candidates, kind, 1, capacity, 1 << slot, &values, age_price);
+            }
+            let rate = candidates
+                .iter()
+                .map(|candidate| candidate.rate)
+                .max_by(|a, b| a.compare(*b));
+            let charged_later = uncharged
+                && lane.is_some()
+                && submission.participants[slot]
+                    .is_some_and(|participant| participant.prices_tokens(request.handle));
+            order.push((charged_later, rate, request.handle, position));
+        }
+        order.sort_by(|a, b| {
+            let rate = match (a.1, b.1) {
+                (Some(a), Some(b)) => b.compare(a),
+                // A request without a graph to run is expected last.
+                (a, b) => b.is_some().cmp(&a.is_some()),
+            };
+            a.0.cmp(&b.0).then(rate).then(a.2.slot.cmp(&b.2.slot))
+        });
+        order
+            .into_iter()
+            .map(|(_, _, handle, position)| (handle, position))
+            .collect()
+    }
+
     pub(super) fn mixed_candidates(
         &self,
         output: &mut Vec<Candidate>,

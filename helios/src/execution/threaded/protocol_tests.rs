@@ -351,6 +351,31 @@ fn rank_coordinator_matches_model_pending_window() {
 }
 
 #[test]
+fn an_announcement_waits_for_the_commit_of_the_submission_it_follows() {
+    let mut pending = VecDeque::new();
+    pending.push_back(frame(1, 0, false));
+    // Rank readiness alone does not release it: a rank may still decline the submission.
+    assert!(!announcement_released(&pending, Fence(1)));
+    record_ready(&mut pending, 0, Fence(1), 0).unwrap();
+    record_ready(&mut pending, 1, Fence(1), 0).unwrap();
+    assert!(ready_to_commit(&pending[0]));
+    assert!(!announcement_released(&pending, Fence(1)));
+    pending[0].committed = true;
+    assert!(announcement_released(&pending, Fence(1)));
+    // A later submission still preparing holds only its own announcement.
+    pending.push_back(frame(2, 1, false));
+    assert!(announcement_released(&pending, Fence(1)));
+    assert!(!announcement_released(&pending, Fence(2)));
+    // A submission that completed and left the window was committed.
+    for rank in 0..3 {
+        pending[0].completions[rank] = Some(completion(1, 0));
+    }
+    pop_completed_front(&mut pending).unwrap();
+    assert!(announcement_released(&pending, Fence(1)));
+    assert!(!announcement_released(&pending, Fence(2)));
+}
+
+#[test]
 fn rank_coordinator_matches_model_partial_dispatch() {
     for failed_peer in 0..=3 {
         let mut peers = Vec::new();

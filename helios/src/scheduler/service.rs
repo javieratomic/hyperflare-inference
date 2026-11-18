@@ -31,6 +31,15 @@ pub(super) struct ServiceParticipant {
     delivery_rate: Option<f64>,
 }
 
+impl ServiceParticipant {
+    /// Whether the completion of the participant's submission charges its duration to
+    /// the token service price of `request`: the request took part, and had a token
+    /// rate when the submission was committed.
+    pub(super) fn prices_tokens(&self, request: RequestHandle) -> bool {
+        self.handle == request && self.token_rate.is_some()
+    }
+}
+
 impl ServiceAccounting {
     pub fn publish(&mut self, fence: Fence, adaptation_ms: f64) {
         if let Some(observation) = self.pending_delivery.take() {

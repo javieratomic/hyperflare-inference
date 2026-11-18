@@ -226,7 +226,7 @@ fn prepare_packets_preserve_large_and_partial_uploads_on_both_transports() {
     manifest.graphs[0].input_bindings[2].nbytes = buffer.nbytes;
     manifest.input_frame_bytes = 16 + buffer.nbytes;
     manifest.validate().unwrap();
-    assert_eq!(u64::from_le_bytes(layout(&manifest)[..8].try_into().unwrap()), 6);
+    assert_eq!(u64::from_le_bytes(layout(&manifest)[..8].try_into().unwrap()), 7);
     for (sender, receiver) in [crate::execution::rank_stream::test_pair().unwrap(),
                                (client.into(), server.into())] {
         let mut sender = Channel::new(sender).unwrap();
@@ -270,6 +270,37 @@ fn prepare_packets_preserve_large_and_partial_uploads_on_both_transports() {
                 writer.join().unwrap();
             });
         }
+    }
+}
+
+#[test]
+fn announcement_packets_preserve_windows_and_reject_malformed_extents() {
+    let windows = [
+        PromptWindow { history: &[7, 4_000_000_000], tokens: &[1, 2, 3] },
+        PromptWindow { history: &[], tokens: &[9] },
+        PromptWindow { history: &[5, 6, 8], tokens: &[] },
+    ];
+    let bytes = wire::announcement(Fence(41), &windows).unwrap();
+    let (after, decoded) = wire::read_announcement(&bytes).unwrap();
+    assert_eq!(after, Fence(41));
+    assert_eq!(decoded, [
+        (vec![7, 4_000_000_000], vec![1, 2, 3]),
+        (vec![], vec![9]),
+        (vec![5, 6, 8], vec![]),
+    ]);
+    let (after, decoded) = wire::read_announcement(&wire::announcement(Fence(1), &[]).unwrap()).unwrap();
+    assert_eq!((after, decoded.len()), (Fence(1), 0));
+
+    assert!(wire::read_announcement(&bytes[..bytes.len() - 1]).is_err());
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert!(wire::read_announcement(&trailing).is_err());
+    // A window count, history count or token count beyond the packet must fail before
+    // any allocation sized by it.
+    for field in [8, 16, 24] {
+        let mut oversized = bytes.clone();
+        oversized[field..field + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(wire::read_announcement(&oversized).is_err());
     }
 }
 
@@ -621,6 +652,62 @@ fn two_frame_window_retains_preparing_and_unconsumed_completions() {
     assert!(completion_frame(&mut pending, 0, Fence(1), 0).is_err());
     assert!(completion_frame(&mut pending, 0, Fence(2), 1).is_err());
     completion_frame(&mut pending, 0, Fence(2), 0).unwrap();
+}
+
+#[test]
+fn an_announcement_waits_for_the_commit_of_the_submission_it_follows() {
+    let frame = |sequence| Pending {
+        fence: Fence(sequence), graph: 0, grammar: false, uploads: Vec::new(),
+        dispatched: Instant::now(), committed: false, queued: sequence > 1,
+        ready: vec![false; 3], completions: (0..4).map(|_| None).collect(),
+    };
+    let mut pending = VecDeque::new();
+    pending.push_back(frame(1));
+    // Rank readiness alone does not release it: a rank may still decline the submission.
+    assert!(!announcement_released(&pending, Fence(1)));
+    for rank in 0..3 { ready_frame(&mut pending, rank, Fence(1), 0).unwrap(); }
+    assert!(!announcement_released(&pending, Fence(1)));
+    pending[0].committed = true;
+    assert!(announcement_released(&pending, Fence(1)));
+    // A later submission still preparing holds only its own announcement.
+    pending.push_back(frame(2));
+    assert!(announcement_released(&pending, Fence(1)));
+    assert!(!announcement_released(&pending, Fence(2)));
+    // A submission that completed and left the window was committed.
+    pending.pop_front();
+    assert!(announcement_released(&pending, Fence(1)));
+    assert!(!announcement_released(&pending, Fence(2)));
+}
+
+#[test]
+fn a_peer_greeting_carries_its_identity_layout_and_whether_it_reads_ahead() {
+    // A layout starts with its version, as `layout` writes it.
+    let mut layout = Vec::new();
+    number(&mut layout, 7);
+    layout.extend_from_slice(&[4, 0, 3, 9]);
+    let mut other = layout.clone();
+    *other.last_mut().unwrap() ^= 1;
+    for reads_ahead in [false, true] {
+        let bytes = hello(2, 3, reads_ahead, &layout);
+        assert_eq!(read_hello(&bytes, 2, 3, &layout).unwrap(), reads_ahead);
+        // Another rank, another world size and another layout are refused alike.
+        assert!(read_hello(&bytes, 1, 3, &layout).is_err());
+        assert!(read_hello(&bytes, 2, 4, &layout).is_err());
+        assert!(read_hello(&bytes, 2, 3, &layout[..layout.len() - 1]).is_err());
+        assert!(read_hello(&bytes, 2, 3, &other).is_err());
+        assert!(read_hello(&bytes[..23], 2, 3, &layout).is_err());
+    }
+    // The flag is zero or one.
+    let mut bytes = hello(2, 3, true, &layout);
+    bytes[16] = 2;
+    assert!(read_hello(&bytes, 2, 3, &layout).is_err());
+    // A greeting without the flag has the layout's version in its place and is refused.
+    let mut unflagged = Vec::new();
+    for value in [2, 3] {
+        number(&mut unflagged, value);
+    }
+    unflagged.extend_from_slice(&layout);
+    assert!(read_hello(&unflagged, 2, 3, &layout).is_err());
 }
 
 #[test]
